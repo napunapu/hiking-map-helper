@@ -13,13 +13,15 @@ difficulty ratings.
 ## Usage
 
 ```sh
-groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>]
+groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>]
 ```
 
 | Option | Description | Default |
 | --- | --- | --- |
 | `-w`, `--window` | Moving-average smoothing window, in points | `5` |
 | `-o`, `--output` | Output HTML file path | `<input>-profile.html` |
+| `-t`, `--temp` | Forecast max ambient temperature in shade, in °C | `20.0` |
+| `-e`, `--exposure` | Route shading factor: `1.0` forest/partial shade, `1.1` fully exposed ridges | `1.0` |
 | `-h`, `--help` | Show usage and exit | |
 | `-V`, `--version` | Show version and exit | |
 
@@ -66,6 +68,35 @@ route":
 In the generated HTML, both ratings are clickable and open a popup
 explaining exactly why that tier was reached, with the underlying numbers
 and thresholds.
+
+## Water intake recommendation
+
+A third clickable tile, "Water", gives a general hydration guideline for a
+healthy adult, using a calibrated Zone 2 endurance model:
+
+- **Burn rate**: 0.35 L/hour at or below 15°C, rising linearly by
+  0.02 L/hour per degree above that (`hourly_rate = 0.35 + max(0, temp -
+  15) * 0.02`).
+- **Exposure**: the burn rate is multiplied by the route's shading factor
+  (`-e`/`--exposure`, 1.0 shaded / 1.1 fully exposed).
+- **Consumption**: `duration_hours * active_hourly_rate`, using the DIN
+  33466 moving-time estimate — duration already reflects this route's
+  vertical effort, so no separate difficulty multiplier is applied on top.
+- **Recommended carry**: consumption plus a fixed 0.5 L safety reserve,
+  rounded to one decimal place.
+
+Since how much water you need depends heavily on how hot it is, the popup
+also shows:
+
+- A small bar chart of recommended carry at a spread of temperatures
+  (10-40°C), so you can read off a figure for whatever your forecast says
+  without needing a live weather lookup.
+- A slider for the day's max forecast temperature **in the shade**, plus a
+  checkbox for a fully exposed route, both updating the readout (and the
+  chart) live as you adjust them.
+
+This is general guidance, not personalised medical advice — individual
+needs vary with body size, fitness and health.
 
 ## Visual output
 

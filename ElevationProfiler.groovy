@@ -23,6 +23,12 @@ class Options {
 
     @Option(names = ['-o', '--output'], description = 'Output HTML file path (default: <input>-profile.html)')
     String outputPath
+
+    @Option(names = ['-t', '--temp'], description = 'Forecast max ambient temperature in shade, in degC (default: 20.0)')
+    double tempCelsius = 20.0
+
+    @Option(names = ['-e', '--exposure'], description = 'Route shading factor: 1.0 = forest/partial shade, 1.1 = fully exposed ridges (default: 1.0)')
+    double exposureFactor = 1.0
 }
 
 double haversine(double lat1, double lon1, double lat2, double lon2) {
@@ -147,6 +153,45 @@ Map shenandoahDifficulty(double ascentM, double distanceKm) {
     [tier: tier, score: score, ascentFt: ascentFt, distanceMi: distanceMi, reason: reason]
 }
 
+Map waterIntakeRecommendation(double durationHours, double tempCelsius, double exposureFactor) {
+    // Calibrated Zone 2 endurance hydration model for a healthy adult. Duration already
+    // reflects this route's vertical effort via the DIN 33466 estimate, so no separate
+    // difficulty multiplier is applied here to avoid double-counting exertion.
+    double reserveVolume = 0.5
+
+    Closure<Double> hourlyRateForTemp = { double t -> 0.35 + Math.max(0.0, t - 15.0) * 0.02 }
+    Closure<Double> carryForTemp = { double t ->
+        double rate = hourlyRateForTemp(t) * exposureFactor
+        Math.round((durationHours * rate + reserveVolume) * 10.0) / 10.0
+    }
+
+    double hourlyRate = hourlyRateForTemp(tempCelsius)
+    double activeHourlyRate = hourlyRate * exposureFactor
+    double consumptionVolume = durationHours * activeHourlyRate
+    double recommendedCarry = Math.round((consumptionVolume + reserveVolume) * 10.0) / 10.0
+
+    List<Double> chartTemps = [10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0]
+    List<Map> chartData = chartTemps.collect { t -> [tempC: t, litres: carryForTemp(t)] }
+
+    String reason = String.format(
+        Locale.ROOT,
+        'Calibrated Zone 2 endurance model: burn rate is %.2f L/h (0.35 L/h baseline at or below 15 degC, ' +
+        '+0.02 L/h per degree above that, x%.2f exposure factor), for %.1f hours moving time gives %.1f L ' +
+        'expected consumption at %.0f degC, plus a fixed 0.5 L reserve = %.1f L recommended carry. Duration ' +
+        'already reflects this route\'s vertical effort via the DIN 33466 estimate, so no separate difficulty ' +
+        'multiplier is applied. This is general guidance, not personalised medical advice; individual needs ' +
+        'vary with body size, fitness and health.',
+        activeHourlyRate, exposureFactor, durationHours, consumptionVolume, tempCelsius, recommendedCarry
+    )
+
+    [
+        tempCelsius: tempCelsius, exposureFactor: exposureFactor, hourlyRate: hourlyRate,
+        activeHourlyRate: activeHourlyRate, consumptionVolume: consumptionVolume,
+        reserveVolume: reserveVolume, recommendedCarry: recommendedCarry,
+        chartData: chartData, reason: reason
+    ]
+}
+
 String formatDuration(double hours) {
     int totalMinutes = Math.round(hours * 60.0) as int
     int h = totalMinutes.intdiv(60)
@@ -154,7 +199,7 @@ String formatDuration(double hours) {
     String.format(Locale.ROOT, '%dh %02dmin', h, m)
 }
 
-void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult) {
+void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult) {
     println '=== Elevation profile summary ==='
     println String.format(Locale.ROOT, 'Total distance : %.2f km', distanceKm)
     println String.format(Locale.ROOT, 'Total ascent   : %.0f m', ascent)
@@ -164,6 +209,11 @@ void printSummary(double distanceKm, double ascent, double descent, double durat
     println "Reason          : ${difficultyResult.reason}"
     println String.format(Locale.ROOT, 'Effort (Shenandoah): %.0f (%s)', shenandoahResult.score as double, shenandoahResult.tier)
     println "Reason          : ${shenandoahResult.reason}"
+    println String.format(Locale.ROOT, 'Forecast temperature : %.0f degC (exposure factor %.2f)', waterResult.tempCelsius as double, waterResult.exposureFactor as double)
+    println String.format(Locale.ROOT, 'Calibrated burn rate : %.2f L/h', waterResult.activeHourlyRate as double)
+    println String.format(Locale.ROOT, 'Expected consumption : %.1f L', waterResult.consumptionVolume as double)
+    println String.format(Locale.ROOT, 'Recommended carry    : %.1f L (includes %.1f L reserve)', waterResult.recommendedCarry as double, waterResult.reserveVolume as double)
+    println "Reason          : ${waterResult.reason}"
 }
 
 String gradeColour(double grade) {
@@ -209,7 +259,47 @@ String buildLegend(int width, int height, int padding) {
     sb.toString()
 }
 
-String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult) {
+String tempBarColour(double tempC) {
+    if (tempC < 15.0) {
+        return '#4FC3F7'
+    }
+    if (tempC < 25.0) {
+        return '#66BB6A'
+    }
+    if (tempC < 32.0) {
+        return '#FDD835'
+    }
+    if (tempC < 38.0) {
+        return '#FB8C00'
+    }
+    '#E53935'
+}
+
+String buildWaterChart(List<Map> chartData, double maxScaleLitres) {
+    int width = 350
+    int height = 140
+    int barGap = 8
+    int barWidth = ((width - (chartData.size() + 1) * barGap) / chartData.size()) as int
+
+    StringBuilder bars = new StringBuilder()
+    chartData.eachWithIndex { entry, idx ->
+        double litres = entry.litres as double
+        double tempC = entry.tempC as double
+        int barHeight = Math.max(4, Math.round((litres / maxScaleLitres) * (height - 34)) as int)
+        int x = barGap + idx * (barWidth + barGap)
+        int y = height - 22 - barHeight
+        String colour = tempBarColour(tempC)
+
+        bars << "<rect id=\"water-bar-${idx}\" class=\"water-bar\" data-temp=\"${fmt(tempC)}\" x=\"${x}\" y=\"${y}\" width=\"${barWidth}\" height=\"${barHeight}\" fill=\"${colour}\" rx=\"2\" />\n"
+        bars << "<text id=\"water-bar-label-${idx}\" x=\"${x + barWidth / 2}\" y=\"${y - 5}\" text-anchor=\"middle\" font-size=\"10\" fill=\"#333\">${String.format(Locale.ROOT, '%.1f', litres)}</text>\n"
+        bars << "<text x=\"${x + barWidth / 2}\" y=\"${height - 6}\" text-anchor=\"middle\" font-size=\"10\" fill=\"#666\">${Math.round(tempC) as int}&#176;</text>\n"
+    }
+
+    """<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+${bars}</svg>"""
+}
+
+String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult) {
     String difficulty = difficultyResult.tier
     String difficultyReason = difficultyResult.reason
     double maxGrade = difficultyResult.maxGrade as double
@@ -219,6 +309,18 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     double shenandoahScore = shenandoahResult.score as double
     double ascentFt = shenandoahResult.ascentFt as double
     double distanceMi = shenandoahResult.distanceMi as double
+    String waterReason = waterResult.reason
+    double waterTempCelsius = waterResult.tempCelsius as double
+    double waterExposureFactor = waterResult.exposureFactor as double
+    double waterActiveHourlyRate = waterResult.activeHourlyRate as double
+    double waterConsumptionVolume = waterResult.consumptionVolume as double
+    double waterReserveVolume = waterResult.reserveVolume as double
+    double waterRecommendedCarry = waterResult.recommendedCarry as double
+    List<Map> waterChartData = waterResult.chartData as List<Map>
+    // Scale chart bars against the hottest, most exposed case so the bars never overflow
+    // when the exposure toggle is switched on in the browser.
+    double waterMaxScaleLitres = Math.round((durationHours * (0.35 + Math.max(0.0, 40.0 - 15.0) * 0.02) * 1.1 + waterReserveVolume) * 10.0) / 10.0
+    String waterChart = buildWaterChart(waterChartData, waterMaxScaleLitres)
     int width = 1100
     int height = 420
     int padding = 50
@@ -348,6 +450,22 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             color: #fff;
             cursor: pointer;
         }
+        .water-bar {
+            transition: opacity 0.15s ease;
+        }
+        .water-slider-row {
+            margin-top: 14px;
+        }
+        .water-slider-row input[type="range"] {
+            width: 100%;
+        }
+        .water-readout {
+            margin-top: 8px;
+            font-size: 14px;
+        }
+        .water-readout strong {
+            font-size: 16px;
+        }
         svg {
             background: #fff;
             border: 1px solid #e0e0e0;
@@ -374,6 +492,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         <div><span>Estimated time</span><strong>${formatDuration(durationHours)}</strong></div>
         <div><span>Difficulty</span><strong class="clickable" onclick="showDifficultyInfo()">${difficulty} &#9432;</strong></div>
         <div><span>Effort (Shenandoah)</span><strong class="clickable" onclick="showEffortInfo()">${effortTier} &#9432;</strong></div>
+        <div><span>Water (at ${Math.round(waterTempCelsius) as int}&deg;C)</span><strong class="clickable" onclick="showWaterInfo()">${String.format(Locale.ROOT, '%.1f L', waterRecommendedCarry)} &#9432;</strong></div>
     </div>
     <div style="position: relative;">
         <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
@@ -424,6 +543,31 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             <button onclick="hideEffortInfo()">Close</button>
         </div>
     </div>
+    <div id="water-modal" class="modal-overlay" onclick="hideWaterInfo()">
+        <div class="modal-box" onclick="event.stopPropagation()">
+            <h2>Water intake recommendation</h2>
+            <p>${escapeXml(waterReason)}</p>
+            ${waterChart}
+            <div class="water-slider-row">
+                <label for="temp-slider">Max forecast temperature (in shade)</label>
+                <input type="range" id="temp-slider" min="0" max="45" step="1" value="${Math.round(waterTempCelsius) as int}" oninput="updateWaterSlider()" />
+            </div>
+            <div class="water-slider-row">
+                <label>
+                    <input type="checkbox" id="exposure-toggle" ${waterExposureFactor >= 1.05 ? 'checked' : ''} onchange="updateWaterSlider()" />
+                    Fully exposed ridge (no shade)
+                </label>
+            </div>
+            <table>
+                <tr><th>Metric</th><th>Value</th></tr>
+                <tr><td>Forecast temperature assumed</td><td><span id="temp-value">${Math.round(waterTempCelsius) as int}</span>&deg;C</td></tr>
+                <tr><td>Calibrated burn rate</td><td><span id="water-rate">${String.format(Locale.ROOT, '%.2f', waterActiveHourlyRate)}</span> L/h</td></tr>
+                <tr><td>Expected consumption</td><td><span id="water-consumption">${String.format(Locale.ROOT, '%.1f', waterConsumptionVolume)}</span> L</td></tr>
+                <tr><td>Recommended carry (incl. ${String.format(Locale.ROOT, '%.1f', waterReserveVolume)} L reserve)</td><td><strong id="water-value">${String.format(Locale.ROOT, '%.1f', waterRecommendedCarry)}</strong> L</td></tr>
+            </table>
+            <button onclick="hideWaterInfo()">Close</button>
+        </div>
+    </div>
     <script>
         var tooltip = document.getElementById('tooltip');
 
@@ -459,10 +603,78 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             effortModal.classList.remove('open');
         }
 
+        var waterModal = document.getElementById('water-modal');
+        var waterDurationHours = ${String.format(Locale.ROOT, '%.4f', durationHours)};
+        var waterReserveVolume = ${String.format(Locale.ROOT, '%.2f', waterReserveVolume)};
+        var waterChartTemps = ${waterChartData.collect { it.tempC as double }.collect { String.format(Locale.ROOT, '%.0f', it) }};
+        var waterMaxScaleLitres = ${String.format(Locale.ROOT, '%.2f', waterMaxScaleLitres)};
+        var waterChartHeight = 140;
+        var waterChartBaselinePad = 22;
+        var waterChartTopPad = 34;
+
+        function showWaterInfo() {
+            waterModal.classList.add('open');
+        }
+
+        function hideWaterInfo() {
+            waterModal.classList.remove('open');
+        }
+
+        // Calibrated Zone 2 endurance model, mirrored from the Groovy calculation so the
+        // slider and exposure toggle can recompute live in the browser.
+        function hourlyRateForTemp(tempC) {
+            return 0.35 + Math.max(0.0, tempC - 15.0) * 0.02;
+        }
+
+        function carryForTemp(tempC, exposureFactor) {
+            var rate = hourlyRateForTemp(tempC) * exposureFactor;
+            return Math.round((waterDurationHours * rate + waterReserveVolume) * 10) / 10;
+        }
+
+        var tempSlider = document.getElementById('temp-slider');
+        var exposureToggle = document.getElementById('exposure-toggle');
+        var tempValueEl = document.getElementById('temp-value');
+        var waterRateEl = document.getElementById('water-rate');
+        var waterConsumptionEl = document.getElementById('water-consumption');
+        var waterValueEl = document.getElementById('water-value');
+
+        function updateWaterSlider() {
+            var tempC = parseFloat(tempSlider.value);
+            var exposureFactor = exposureToggle.checked ? 1.1 : 1.0;
+            var activeHourlyRate = hourlyRateForTemp(tempC) * exposureFactor;
+            var consumption = waterDurationHours * activeHourlyRate;
+            var recommendedCarry = Math.round((consumption + waterReserveVolume) * 10) / 10;
+
+            tempValueEl.textContent = tempC.toFixed(0);
+            waterRateEl.textContent = activeHourlyRate.toFixed(2);
+            waterConsumptionEl.textContent = consumption.toFixed(1);
+            waterValueEl.textContent = recommendedCarry.toFixed(1);
+
+            for (var i = 0; i < waterChartTemps.length; i++) {
+                var chartTemp = parseFloat(waterChartTemps[i]);
+                var litres = carryForTemp(chartTemp, exposureFactor);
+                var barHeight = Math.max(4, Math.round((litres / waterMaxScaleLitres) * (waterChartHeight - waterChartTopPad)));
+                var bar = document.getElementById('water-bar-' + i);
+                var label = document.getElementById('water-bar-label-' + i);
+                if (bar) {
+                    bar.setAttribute('height', barHeight);
+                    bar.setAttribute('y', waterChartHeight - waterChartBaselinePad - barHeight);
+                    bar.style.opacity = (Math.abs(chartTemp - tempC) <= 3) ? '1' : '0.5';
+                }
+                if (label) {
+                    label.textContent = litres.toFixed(1);
+                    label.setAttribute('y', waterChartHeight - waterChartBaselinePad - barHeight - 5);
+                }
+            }
+        }
+
+        updateWaterSlider();
+
         document.addEventListener('keydown', function (evt) {
             if (evt.key === 'Escape') {
                 hideDifficultyInfo();
                 hideEffortInfo();
+                hideWaterInfo();
             }
         });
     </script>
@@ -551,9 +763,10 @@ double totalDistanceKm = cumulative / 1000.0
 double durationHours = din33466Duration(totalDistanceKm, totalAscent, totalDescent)
 Map difficultyResult = classifyDifficulty(totalAscent, totalDistanceKm, maxGrade, clampedGradeCount)
 Map shenandoahResult = shenandoahDifficulty(totalAscent, totalDistanceKm)
+Map waterResult = waterIntakeRecommendation(durationHours, options.tempCelsius, options.exposureFactor)
 
-printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult)
+printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult)
 
 File output = options.outputPath ? new File(options.outputPath) : new File(options.gpxFile.absoluteFile.parentFile, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '-profile.html')
-output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult)
+output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult)
 println "Elevation profile written to: ${output.absolutePath}"
