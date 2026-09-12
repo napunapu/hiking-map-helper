@@ -1,19 +1,21 @@
 # Elevation profiler
 
 A standalone Groovy script that turns a GPX hiking route into a colour-coded
-elevation profile, with distance, ascent/descent and two independent
-difficulty ratings.
+elevation profile, with distance, ascent/descent, two independent difficulty
+ratings, a hydration recommendation and trail surface data pulled from
+OpenStreetMap.
 
 ## Requirements
 
 - [Groovy](https://groovy-lang.org/) on your `PATH`.
 - Internet access on first run, so `@Grab` can download
-  [picocli](https://picocli.info/) (cached afterwards).
+  [picocli](https://picocli.info/) (cached afterwards), and to query the
+  Overpass API for trail surface data (no API key needed; see below).
 
 ## Usage
 
 ```sh
-groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>]
+groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>] [--no-cache]
 ```
 
 | Option | Description | Default |
@@ -22,6 +24,7 @@ groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t
 | `-o`, `--output` | Output HTML file path | `<input>-profile.html` |
 | `-t`, `--temp` | Forecast max ambient temperature in shade, in °C | `20.0` |
 | `-e`, `--exposure` | Route shading factor: `1.0` forest/partial shade, `1.1` fully exposed ridges | `1.0` |
+| `--no-cache` | Force re-querying the Overpass API even if a cached response exists | `false` |
 | `-h`, `--help` | Show usage and exit | |
 | `-V`, `--version` | Show version and exit | |
 
@@ -98,15 +101,96 @@ also shows:
 This is general guidance, not personalised medical advice — individual
 needs vary with body size, fitness and health.
 
+## Trail surface via OpenStreetMap
+
+The tool fetches every navigable `highway` way in the route's bounding box
+(padded by 0.005° / ~500 m on each side) from the public
+[Overpass API](https://wiki.openstreetmap.org/wiki/Overpass_API) — no API
+key required — and geometrically snaps each GPX point to the nearest way to
+read its `surface`, `sac_scale`, `tracktype` and `highway` tags. This lets
+the tool know, for example, that a descent is on loose gravel rather than
+pavement.
+
+- **Caching**: the raw Overpass response is saved next to the input file as
+  `<gpxBaseName>.osm.json`. On the next run, if that file exists it is
+  loaded directly and the API is not called again — pass `--no-cache` to
+  force a fresh request.
+- **Snapping**: for each GPX point, every candidate way segment within its
+  bounding box is checked using a local planar projection (accurate at this
+  scale, and far cheaper than repeated great-circle math) to find the
+  closest point-to-segment distance. If the nearest segment is within 30 m,
+  its tags are used; if the `surface` tag itself is missing but `highway` is
+  a standard paved class (residential, primary, secondary, ...), `surface`
+  is inferred as `"paved"`.
+- **No match, or the request fails**: if nothing is found within 30 m, or
+  Overpass is unreachable/times out/rate-limits and no cache exists, the
+  tool warns and falls back to `surface: "unknown"`, `sac_scale: "none"` for
+  every point — the run always completes.
+
+## Mechanical descent strain
+
+A steep, loose-surfaced descent loads the quads and knees eccentrically
+(braking strain) far more than the same gradient on a smooth path. The
+"Steep descent" tile sums the distance of every descent steeper than -15%,
+split by surface:
+
+- **Smooth**: paved or asphalt.
+- **Rough**: gravel, ground, path, unpaved, or unknown (i.e. anything that
+  isn't a hard, even surface) — everything is counted as rough when no OSM
+  match is available.
+
+## Trail strain model
+
+A fourth clickable tile, "Trail strain", combines terrain and technical
+difficulty with gradient into a single 0-100 score, separating *metabolic*
+cost (how tiring) from *biomechanical* cost (how jarring):
+
+- **Terrain factor (eta)**: how much harder a surface is to move over than
+  firm pavement — 1.0 for paved/asphalt/concrete, 1.1 for compacted/fine
+  gravel, 1.25 for dirt/earth/ground/grass/path, 1.5 for gravel/unpaved/
+  stones/rock, 1.9 for scree/sand/boulders, 1.2 as a fallback for anything
+  unrecognised.
+- **Technical factor**: from the OSM `sac_scale` tag — 1.0 for
+  hiking/T1/none, 1.15 for mountain_hiking/T2, 1.35 for
+  demanding_mountain_hiking/T3, 1.6 for alpine_hiking/T4 and above.
+- **Metabolic cost**: [Minetti's polynomial approximation](https://en.wikipedia.org/wiki/Locomotion_energetics)
+  of energy cost per unit distance as a function of gradient, normalised so
+  flat pavement costs exactly `1.0` ("as costly as walking flat ground"),
+  then scaled by the terrain and technical factors. Summed and divided by
+  1000, this gives the **effort distance**: the equivalent flat-paved
+  distance this route actually costs to walk.
+- **Eccentric braking strain**: on any segment steeper than -10%, an
+  additional `(|grade| / 10%)²` penalty (also scaled by terrain/technical
+  factor) models the extra quad/knee loading from braking on a steep
+  descent — this grows quickly, since braking strain compounds with both
+  steepness and rough footing.
+- **Composite score**: `effort distance + braking index/1000`, scaled so a
+  reference 20 km / 500 m route on flat T1 pavement lands at 50/100 — so a
+  score meaningfully above 50 indicates a route that's harder, in this
+  combined sense, than a "standard" 20 km day out.
+
+The tile's popup also lists the surface breakdown by % of distance, and the
+high-strain descent distance (descents steeper than -15% on a rough or
+loose surface, i.e. eta >= 1.25).
+
 ## Visual output
 
-The HTML file contains a self-contained SVG elevation profile:
+The HTML file contains a self-contained, responsive SVG elevation profile:
 
-- The area under the curve is colour-coded by slope gradient — downhill
-  (blue), flat/gentle 0-6% (green), moderate 6-12% (yellow), steep 12-20%
-  (orange), very steep >20% (red).
-- Hovering over the profile shows distance, elevation and grade at that
-  point.
+- A "Colour by" toggle switches the profile between two colouring modes:
+  - **Gradient**: steep/braking descent below -15% (dark purple), gentle
+    descent -15% to 0% (light cyan), flat/mild 0-6% (green), moderate climb
+    6-12% (yellow), steep climb 12-20% (orange), severe climb above 20%
+    (red).
+  - **Strain intensity**: the combined metabolic + braking strain at each
+    point, from low (cyan) through flat-equivalent (green), moderate
+    (yellow), high (orange) to extreme (dark red) — this can highlight
+    rough, technical descents that a pure-gradient view would just show as
+    "steep".
+- Hovering over the profile shows a crosshair at that point, plus a tooltip
+  with distance, elevation, instantaneous gradient, surface type, SAC trail
+  scale, the local terrain multiplier (eta) and the relative strain factor
+  (e.g. "1.4x flat equivalent").
 - No external assets are loaded; the file can be opened directly in a
   browser or shared as-is.
 

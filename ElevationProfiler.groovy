@@ -6,6 +6,11 @@ import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
 
 import groovy.xml.XmlSlurper
+import groovy.json.JsonSlurper
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
 
 @Command(
     name = 'ElevationProfiler',
@@ -29,6 +34,9 @@ class Options {
 
     @Option(names = ['-e', '--exposure'], description = 'Route shading factor: 1.0 = forest/partial shade, 1.1 = fully exposed ridges (default: 1.0)')
     double exposureFactor = 1.0
+
+    @Option(names = ['--no-cache'], description = 'Force re-querying the Overpass API even if a cached OpenStreetMap response exists')
+    boolean noCache = false
 }
 
 double haversine(double lat1, double lon1, double lat2, double lon2) {
@@ -55,6 +63,220 @@ List<Map> parseGpx(File file) {
         points << [lat: lat, lon: lon, ele: ele]
     }
     points
+}
+
+Map computeBoundingBox(List<Map> points) {
+    double padDegrees = 0.005
+    double minLat = points.collect { it.lat as double }.min() - padDegrees
+    double maxLat = points.collect { it.lat as double }.max() + padDegrees
+    double minLon = points.collect { it.lon as double }.min() - padDegrees
+    double maxLon = points.collect { it.lon as double }.max() + padDegrees
+    [minLat: minLat, minLon: minLon, maxLat: maxLat, maxLon: maxLon]
+}
+
+String buildOverpassQuery(Map bbox) {
+    String bboxStr = [bbox.minLat, bbox.minLon, bbox.maxLat, bbox.maxLon]
+        .collect { String.format(Locale.ROOT, '%.6f', it as double) }
+        .join(',')
+    "[out:json][timeout:30];\nway[\"highway\"](${bboxStr});\nout tags geom;"
+}
+
+String fetchOverpassRaw(Map bbox) {
+    String query = buildOverpassQuery(bbox)
+    String url = 'https://overpass-api.de/api/interpreter'
+    String body = "data=${URLEncoder.encode(query, 'UTF-8')}"
+
+    HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
+    HttpRequest request = HttpRequest.newBuilder()
+        .uri(URI.create(url))
+        .header('Content-Type', 'application/x-www-form-urlencoded')
+        .timeout(Duration.ofSeconds(45))
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+
+    HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    if (response.statusCode() != 200) {
+        throw new RuntimeException("Overpass API request failed with HTTP ${response.statusCode()}: ${response.body()?.take(200)}")
+    }
+    response.body()
+}
+
+List<Map> parseOsmWays(Map osmData) {
+    if (!osmData || !osmData.elements) {
+        return []
+    }
+    // Overpass's "geom" query keyword requests full geometry, but the JSON response
+    // key for a way's coordinate list is "geometry", not "geom".
+    (osmData.elements as List).findAll { el ->
+        (el as Map).type == 'way' && (el as Map).geometry
+    }.collect { el ->
+        Map e = el as Map
+        [
+            geom: (e.geometry as List).collect { g -> [lat: (g as Map).lat as double, lon: (g as Map).lon as double] },
+            tags: (e.tags ?: [:]) as Map
+        ]
+    }
+}
+
+String inferSurfaceFromHighway(String highway) {
+    Set<String> paved = ['residential', 'primary', 'secondary', 'tertiary', 'unclassified', 'living_street', 'service', 'trunk', 'motorway'] as Set
+    (highway && paved.contains(highway)) ? 'paved' : 'unknown'
+}
+
+// A local equirectangular projection is accurate enough at the scale of a 30 m matching
+// threshold, and is far cheaper than repeated great-circle math over many OSM segments.
+double pointToSegmentDistanceM(double plat, double plon, double alat, double alon, double blat, double blon) {
+    double refLat = Math.toRadians((alat + blat) / 2.0)
+    double kx = 111320.0 * Math.cos(refLat)
+    double ky = 110540.0
+
+    double ax = alon * kx
+    double ay = alat * ky
+    double bx = blon * kx
+    double by = blat * ky
+    double px = plon * kx
+    double py = plat * ky
+
+    double dx = bx - ax
+    double dy = by - ay
+    double lengthSq = dx * dx + dy * dy
+
+    double t = lengthSq == 0.0 ? 0.0 : Math.max(0.0, Math.min(1.0, ((px - ax) * dx + (py - ay) * dy) / lengthSq))
+    double projX = ax + t * dx
+    double projY = ay + t * dy
+    double ddx = px - projX
+    double ddy = py - projY
+    Math.sqrt(ddx * ddx + ddy * ddy)
+}
+
+Map nearestWayInfo(double plat, double plon, List<Map> ways, double thresholdM) {
+    double latPad = thresholdM / 110540.0
+    double lonPad = thresholdM / (111320.0 * Math.cos(Math.toRadians(plat)))
+
+    double bestDist = Double.MAX_VALUE
+    Map bestTags = null
+
+    for (way in ways) {
+        List<Map> geom = way.geom as List<Map>
+        for (int i = 1; i < geom.size(); i++) {
+            Map a = geom[i - 1]
+            Map b = geom[i]
+            double aLat = a.lat as double
+            double aLon = a.lon as double
+            double bLat = b.lat as double
+            double bLon = b.lon as double
+
+            // Cheap bounding-box rejection before the more expensive projected distance.
+            if (Math.min(aLat, bLat) - latPad > plat || Math.max(aLat, bLat) + latPad < plat) {
+                continue
+            }
+            if (Math.min(aLon, bLon) - lonPad > plon || Math.max(aLon, bLon) + lonPad < plon) {
+                continue
+            }
+
+            double d = pointToSegmentDistanceM(plat, plon, aLat, aLon, bLat, bLon)
+            if (d < bestDist) {
+                bestDist = d
+                bestTags = way.tags as Map
+            }
+        }
+    }
+
+    if (bestTags == null || bestDist > thresholdM) {
+        return [surface: 'unknown', sacScale: 'none', tracktype: 'unknown', highway: 'unknown', distanceM: bestDist]
+    }
+
+    String highway = (bestTags.highway ?: 'unknown') as String
+    String surface = bestTags.surface ? (bestTags.surface as String) : inferSurfaceFromHighway(highway)
+    String sacScale = bestTags.sac_scale ? (bestTags.sac_scale as String) : 'none'
+    String tracktype = bestTags.tracktype ? (bestTags.tracktype as String) : 'unknown'
+
+    [surface: surface, sacScale: sacScale, tracktype: tracktype, highway: highway, distanceM: bestDist]
+}
+
+// Terrain factor (eta): how much harder a surface is to move over than firm pavement,
+// independent of gradient. Grouped from OSM's "surface" tag values.
+double terrainFactorForSurface(String surface) {
+    String s = (surface ?: '').toLowerCase()
+    Set<String> paved = ['asphalt', 'concrete', 'paved', 'paving_stones'] as Set
+    Set<String> compact = ['compacted', 'fine_gravel', 'hard'] as Set
+    Set<String> standardTrail = ['dirt', 'earth', 'ground', 'grass', 'path'] as Set
+    Set<String> roughLoose = ['gravel', 'unpaved', 'stones', 'pebbles', 'rock'] as Set
+    Set<String> severeLoose = ['scree', 'sand', 'boulders'] as Set
+
+    if (paved.contains(s)) {
+        return 1.0
+    }
+    if (compact.contains(s)) {
+        return 1.1
+    }
+    if (standardTrail.contains(s)) {
+        return 1.25
+    }
+    if (roughLoose.contains(s)) {
+        return 1.5
+    }
+    if (severeLoose.contains(s)) {
+        return 1.9
+    }
+    1.2
+}
+
+// Technical penalty (T-factor): the extra care/exposure/scrambling load implied by the
+// SAC hiking scale, independent of gradient and surface.
+double technicalFactorForSacScale(String sacScale) {
+    String s = (sacScale ?: '').toLowerCase()
+    if (s in ['mountain_hiking', 't2']) {
+        return 1.15
+    }
+    if (s in ['demanding_mountain_hiking', 't3']) {
+        return 1.35
+    }
+    if (s in ['alpine_hiking', 't4', 'demanding_alpine_hiking', 't5', 'difficult_alpine_hiking', 't6']) {
+        return 1.6
+    }
+    // hiking / T1 / none, and anything unrecognised, is treated as the neutral baseline.
+    1.0
+}
+
+// Minetti's polynomial approximation of metabolic cost per unit distance, as a function of
+// gradient (a fraction, not a percentage), normalised so flat ground (i = 0) costs exactly
+// 1.0 - i.e. "1.0x" means "as costly as walking flat pavement". Clamped at 0.5 since even a
+// gentle descent still costs some minimum effort to keep moving.
+double minettiCostMultiplier(double gradeFraction) {
+    double i = gradeFraction
+    double cw = 280.5 * Math.pow(i, 5) - 58.7 * Math.pow(i, 4) - 268.3 * Math.pow(i, 3) + 95.8 * Math.pow(i, 2) + 4.13 * i + 3.6
+    Math.max(0.5, cw / 3.6)
+}
+
+String strainColour(double intensity) {
+    if (intensity < 0.8) {
+        return '#4DD0E1'
+    }
+    if (intensity < 1.3) {
+        return '#66BB6A'
+    }
+    if (intensity < 2.5) {
+        return '#FDD835'
+    }
+    if (intensity < 5.0) {
+        return '#FB8C00'
+    }
+    '#B71C1C'
+}
+
+// A 0-100 index scaled against a hypothetical reference route: 20 km with 500 m of gentle
+// climbing then 500 m of gentle descending (+/-5% grade, well below the -10% braking
+// threshold), entirely on T1/paved terrain. That reference route is defined to land at 50
+// on the scale, so routes roughly twice as metabolically/mechanically costly land near 100.
+double compositeStrainScore(double effortDistanceKm, double totalBrakingIndex) {
+    double refHalfDistanceM = 10000.0
+    double refEffortDistanceKm = refHalfDistanceM * (minettiCostMultiplier(0.05) + minettiCostMultiplier(-0.05)) / 1000.0
+    double refCombined = refEffortDistanceKm
+
+    double actualCombined = effortDistanceKm + (totalBrakingIndex / 1000.0)
+    double score = refCombined > 0 ? (actualCombined / refCombined) * 50.0 : 0.0
+    Math.max(0.0, Math.min(100.0, score))
 }
 
 List<Double> movingAverage(List<Double> values, int windowSize) {
@@ -192,6 +414,29 @@ Map waterIntakeRecommendation(double durationHours, double tempCelsius, double e
     ]
 }
 
+Map trailStrainSummary(double effortDistanceKm, double actualDistanceKm, double totalBrakingIndex, double highStrainDescentKm, Map<String, Double> surfaceDistanceM, double totalDistanceM) {
+    double score = compositeStrainScore(effortDistanceKm, totalBrakingIndex)
+
+    List<Map> surfaceBreakdown = totalDistanceM > 0
+        ? surfaceDistanceM.collect { surface, distM -> [surface: surface, pct: (distM / totalDistanceM) * 100.0] }.sort { -it.pct }
+        : []
+
+    String reason = String.format(
+        Locale.ROOT,
+        'Composite strain score is %.0f/100, scaled against a reference 20 km / 500 m T1 route on paved ' +
+        'ground. This route\'s effort distance is %.2f km (metabolic cost, equivalent flat paved km) versus ' +
+        '%.2f km actual, with a braking load index of %.0f from %.2f km of high-strain technical descent ' +
+        '(steeper than -15%% on rough or loose surface).',
+        score, effortDistanceKm, actualDistanceKm, totalBrakingIndex, highStrainDescentKm
+    )
+
+    [
+        score: score, effortDistanceKm: effortDistanceKm, actualDistanceKm: actualDistanceKm,
+        totalBrakingIndex: totalBrakingIndex, highStrainDescentKm: highStrainDescentKm,
+        surfaceBreakdown: surfaceBreakdown, reason: reason
+    ]
+}
+
 String formatDuration(double hours) {
     int totalMinutes = Math.round(hours * 60.0) as int
     int h = totalMinutes.intdiv(60)
@@ -199,12 +444,13 @@ String formatDuration(double hours) {
     String.format(Locale.ROOT, '%dh %02dmin', h, m)
 }
 
-void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult) {
+void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain) {
     println '=== Elevation profile summary ==='
     println String.format(Locale.ROOT, 'Total distance : %.2f km', distanceKm)
     println String.format(Locale.ROOT, 'Total ascent   : %.0f m', ascent)
     println String.format(Locale.ROOT, 'Total descent  : %.0f m', descent)
     println "Estimated time  : ${formatDuration(durationHours)} (DIN 33466)"
+    println "Trail data      : ${trailInfo.matched ? 'Matched to OpenStreetMap (surface/SAC scale available)' : 'Raw GPX (no OSM match; surface/SAC scale unknown)'}"
     println "Difficulty      : ${difficultyResult.tier}"
     println "Reason          : ${difficultyResult.reason}"
     println String.format(Locale.ROOT, 'Effort (Shenandoah): %.0f (%s)', shenandoahResult.score as double, shenandoahResult.tier)
@@ -214,11 +460,25 @@ void printSummary(double distanceKm, double ascent, double descent, double durat
     println String.format(Locale.ROOT, 'Expected consumption : %.1f L', waterResult.consumptionVolume as double)
     println String.format(Locale.ROOT, 'Recommended carry    : %.1f L (includes %.1f L reserve)', waterResult.recommendedCarry as double, waterResult.reserveVolume as double)
     println "Reason          : ${waterResult.reason}"
+    println String.format(Locale.ROOT, 'Steep descent (< -15%%): %.2f km', (descentStrain.steepDescentDistanceM as double) / 1000.0)
+    println String.format(Locale.ROOT, '  - Smooth (paved)     : %.2f km', (descentStrain.smoothSteepDescentDistanceM as double) / 1000.0)
+    println String.format(Locale.ROOT, '  - Rough (trail)      : %.2f km', (descentStrain.roughSteepDescentDistanceM as double) / 1000.0)
+    println String.format(Locale.ROOT, 'Effort distance      : %.2f km (actual: %.2f km)', trailStrain.effortDistanceKm as double, trailStrain.actualDistanceKm as double)
+    println String.format(Locale.ROOT, 'Braking load index   : %.0f', trailStrain.totalBrakingIndex as double)
+    println String.format(Locale.ROOT, 'High-strain descent  : %.2f km (< -15%% grade on rough/loose surface)', trailStrain.highStrainDescentKm as double)
+    println String.format(Locale.ROOT, 'Trail strain score   : %.0f/100', trailStrain.score as double)
+    println 'Surface breakdown    :'
+    (trailStrain.surfaceBreakdown as List<Map>).each { entry ->
+        println String.format(Locale.ROOT, '  - %-10s: %.1f%%', entry.surface, entry.pct as double)
+    }
 }
 
 String gradeColour(double grade) {
+    if (grade < -15.0) {
+        return '#6A1B9A'
+    }
     if (grade < 0.0) {
-        return '#4FC3F7'
+        return '#4DD0E1'
     }
     if (grade < 6.0) {
         return '#66BB6A'
@@ -242,19 +502,39 @@ String escapeXml(String s) {
 
 String buildLegend(int width, int height, int padding) {
     List<List<String>> entries = [
-        ['#4FC3F7', 'Downhill (< 0%)'],
-        ['#66BB6A', 'Flat / gentle (0-6%)'],
-        ['#FDD835', 'Moderate (6-12%)'],
-        ['#FB8C00', 'Steep (12-20%)'],
-        ['#E53935', 'Very steep (> 20%)']
+        ['#6A1B9A', 'Steep/braking descent (< -15%)'],
+        ['#4DD0E1', 'Gentle descent (-15% to 0%)'],
+        ['#66BB6A', 'Flat / mild (0-6%)'],
+        ['#FDD835', 'Moderate climb (6-12%)'],
+        ['#FB8C00', 'Steep climb (12-20%)'],
+        ['#E53935', 'Severe climb (> 20%)']
     ]
     int x = padding
     int y = height - 14
     StringBuilder sb = new StringBuilder()
     entries.eachWithIndex { entry, idx ->
-        int ex = x + idx * 170
+        int ex = x + idx * 165
         sb << "<rect x=\"${ex}\" y=\"${y - 10}\" width=\"12\" height=\"12\" fill=\"${entry[0]}\" />\n"
-        sb << "<text x=\"${ex + 16}\" y=\"${y}\" font-size=\"11\" fill=\"#333\">${entry[1]}</text>\n"
+        sb << "<text x=\"${ex + 16}\" y=\"${y}\" font-size=\"10\" fill=\"#333\">${entry[1]}</text>\n"
+    }
+    sb.toString()
+}
+
+String buildStrainLegend(int width, int height, int padding) {
+    List<List<String>> entries = [
+        ['#4DD0E1', 'Low (< 0.8x)'],
+        ['#66BB6A', 'Flat-equivalent (0.8-1.3x)'],
+        ['#FDD835', 'Moderate (1.3-2.5x)'],
+        ['#FB8C00', 'High (2.5-5x)'],
+        ['#B71C1C', 'Extreme (>= 5x)']
+    ]
+    int x = padding
+    int y = height - 14
+    StringBuilder sb = new StringBuilder()
+    entries.eachWithIndex { entry, idx ->
+        int ex = x + idx * 195
+        sb << "<rect x=\"${ex}\" y=\"${y - 10}\" width=\"12\" height=\"12\" fill=\"${entry[0]}\" />\n"
+        sb << "<text x=\"${ex + 16}\" y=\"${y}\" font-size=\"10\" fill=\"#333\">${entry[1]}</text>\n"
     }
     sb.toString()
 }
@@ -299,7 +579,7 @@ String buildWaterChart(List<Map> chartData, double maxScaleLitres) {
 ${bars}</svg>"""
 }
 
-String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult) {
+String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain) {
     String difficulty = difficultyResult.tier
     String difficultyReason = difficultyResult.reason
     double maxGrade = difficultyResult.maxGrade as double
@@ -321,6 +601,16 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     // when the exposure toggle is switched on in the browser.
     double waterMaxScaleLitres = Math.round((durationHours * (0.35 + Math.max(0.0, 40.0 - 15.0) * 0.02) * 1.1 + waterReserveVolume) * 10.0) / 10.0
     String waterChart = buildWaterChart(waterChartData, waterMaxScaleLitres)
+    boolean trailMatched = trailInfo.matched as boolean
+    double steepDescentKm = (descentStrain.steepDescentDistanceM as double) / 1000.0
+    double smoothSteepDescentKm = (descentStrain.smoothSteepDescentDistanceM as double) / 1000.0
+    double roughSteepDescentKm = (descentStrain.roughSteepDescentDistanceM as double) / 1000.0
+    double trailStrainScore = trailStrain.score as double
+    double effortDistanceKm = trailStrain.effortDistanceKm as double
+    double totalBrakingIndex = trailStrain.totalBrakingIndex as double
+    double highStrainDescentKm = trailStrain.highStrainDescentKm as double
+    String trailStrainReason = trailStrain.reason
+    List<Map> surfaceBreakdown = trailStrain.surfaceBreakdown as List<Map>
     int width = 1100
     int height = 420
     int padding = 50
@@ -336,6 +626,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     Closure<Double> yFor = { double e -> padding + plotHeight - ((e - minEle) / eleRange) * plotHeight }
 
     StringBuilder segments = new StringBuilder()
+    StringBuilder strainSegments = new StringBuilder()
     StringBuilder hitAreas = new StringBuilder()
 
     for (int i = 1; i < points.size(); i++) {
@@ -347,12 +638,23 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         double y1 = yFor(p1.smoothedEle as double)
         double baseY = padding + plotHeight
         String colour = gradeColour(p1.grade as double)
+        double strainIntensity = p1.strainIntensity as double
+        String strainCol = strainColour(strainIntensity)
 
-        segments << "<polygon points=\"${fmt(x0)},${fmt(baseY)} ${fmt(x0)},${fmt(y0)} ${fmt(x1)},${fmt(y1)} ${fmt(x1)},${fmt(baseY)}\" fill=\"${colour}\" stroke=\"${colour}\" stroke-width=\"0.5\" />\n"
+        String polyPoints = "${fmt(x0)},${fmt(baseY)} ${fmt(x0)},${fmt(y0)} ${fmt(x1)},${fmt(y1)} ${fmt(x1)},${fmt(baseY)}"
+        segments << "<polygon points=\"${polyPoints}\" fill=\"${colour}\" stroke=\"${colour}\" stroke-width=\"0.5\" />\n"
+        strainSegments << "<polygon points=\"${polyPoints}\" fill=\"${strainCol}\" stroke=\"${strainCol}\" stroke-width=\"0.5\" />\n"
 
         double distKm = (p1.distance as double) / 1000.0
-        String tooltip = String.format(Locale.ROOT, '%.2f km | %.0f m | %.1f%%', distKm, p1.smoothedEle as double, p1.grade as double)
-        hitAreas << "<rect x=\"${fmt(Math.min(x0, x1))}\" y=\"${padding}\" width=\"${fmt(Math.max(1.0d, Math.abs(x1 - x0)))}\" height=\"${plotHeight}\" fill=\"transparent\" data-tip=\"${escapeXml(tooltip)}\" onmousemove=\"showTip(event)\" onmouseleave=\"hideTip()\" />\n"
+        String surface = (p1.surface ?: 'unknown') as String
+        String sacScale = (p1.sacScale ?: 'unknown') as String
+        double eta = p1.eta as double
+        double strainFactor = p1.strainFactor as double
+        String tooltip = String.format(
+            Locale.ROOT, '%.2f km | %.0f m | %.1f%% | surface: %s | SAC: %s | eta: %.2f | strain: %.1fx flat equivalent',
+            distKm, p1.smoothedEle as double, p1.grade as double, surface, sacScale, eta, strainFactor
+        )
+        hitAreas << "<rect x=\"${fmt(Math.min(x0, x1))}\" y=\"${padding}\" width=\"${fmt(Math.max(1.0d, Math.abs(x1 - x0)))}\" height=\"${plotHeight}\" fill=\"transparent\" data-tip=\"${escapeXml(tooltip)}\" data-x=\"${fmt(x1)}\" onmousemove=\"showTip(event)\" onmouseleave=\"hideTip()\" />\n"
     }
 
     StringBuilder grid = new StringBuilder()
@@ -365,6 +667,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     }
 
     String legend = buildLegend(width, height, padding)
+    String strainLegend = buildStrainLegend(width, height, padding)
 
     """<!DOCTYPE html>
 <html lang="en">
@@ -404,6 +707,26 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         .clickable {
             cursor: pointer;
             text-decoration: underline dotted;
+        }
+        .mode-toggle {
+            margin-bottom: 10px;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .mode-btn {
+            padding: 5px 12px;
+            border: 1px solid #ccc;
+            border-radius: 999px;
+            background: #fff;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .mode-btn.active {
+            background: #333;
+            color: #fff;
+            border-color: #333;
         }
         .modal-overlay {
             display: none;
@@ -481,6 +804,13 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             font-size: 12px;
             pointer-events: none;
         }
+        #crosshair {
+            display: none;
+            stroke: #000;
+            stroke-width: 1;
+            stroke-dasharray: 4,3;
+            pointer-events: none;
+        }
     </style>
 </head>
 <body>
@@ -493,13 +823,28 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         <div><span>Difficulty</span><strong class="clickable" onclick="showDifficultyInfo()">${difficulty} &#9432;</strong></div>
         <div><span>Effort (Shenandoah)</span><strong class="clickable" onclick="showEffortInfo()">${effortTier} &#9432;</strong></div>
         <div><span>Water (at ${Math.round(waterTempCelsius) as int}&deg;C)</span><strong class="clickable" onclick="showWaterInfo()">${String.format(Locale.ROOT, '%.1f L', waterRecommendedCarry)} &#9432;</strong></div>
+        <div><span>Trail data</span><strong>${trailMatched ? 'OSM-matched' : 'Raw GPX'}</strong></div>
+        <div><span>Steep descent</span><strong class="clickable" onclick="showDescentInfo()">${String.format(Locale.ROOT, '%.2f km', steepDescentKm)} &#9432;</strong></div>
+        <div><span>Trail strain</span><strong class="clickable" onclick="showTrailStrainInfo()">${String.format(Locale.ROOT, '%.0f/100', trailStrainScore)} &#9432;</strong></div>
+    </div>
+    <div class="mode-toggle">
+        <span>Colour by:</span>
+        <button type="button" id="mode-gradient-btn" class="mode-btn active" onclick="setColourMode('gradient')">Gradient</button>
+        <button type="button" id="mode-strain-btn" class="mode-btn" onclick="setColourMode('strain')">Strain intensity</button>
     </div>
     <div style="position: relative;">
         <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
             ${grid}
-            ${segments}
+            <g id="mode-gradient">
+                ${segments}
+                ${legend}
+            </g>
+            <g id="mode-strain" style="display: none;">
+                ${strainSegments}
+                ${strainLegend}
+            </g>
             ${hitAreas}
-            ${legend}
+            <line id="crosshair" x1="0" y1="${padding}" x2="0" y2="${padding + plotHeight}" />
         </svg>
         <div id="tooltip"></div>
     </div>
@@ -568,8 +913,52 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             <button onclick="hideWaterInfo()">Close</button>
         </div>
     </div>
+    <div id="descent-modal" class="modal-overlay" onclick="hideDescentInfo()">
+        <div class="modal-box" onclick="event.stopPropagation()">
+            <h2>Steep descent &amp; mechanical strain</h2>
+            <p>
+                Steep, technical descents load the quads and knees eccentrically (braking
+                strain) far more on loose or uneven ground than on a smooth, paved surface at
+                the same gradient. This splits every descent steeper than -15% by surface type
+                to flag how much of it is likely to feel physically taxing rather than just long.
+            </p>
+            <table>
+                <tr><th>Metric</th><th>This route</th></tr>
+                <tr><td>Total steep descent (&lt; -15%)</td><td>${String.format(Locale.ROOT, '%.2f km', steepDescentKm)}</td></tr>
+                <tr><td>&nbsp;&nbsp;- Smooth (paved/asphalt)</td><td>${String.format(Locale.ROOT, '%.2f km', smoothSteepDescentKm)}</td></tr>
+                <tr><td>&nbsp;&nbsp;- Rough (trail/unknown)</td><td>${String.format(Locale.ROOT, '%.2f km', roughSteepDescentKm)}</td></tr>
+            </table>
+            <p style="font-size: 12px; color: #666;">
+                ${trailMatched
+                    ? 'Surface type comes from the nearest OpenStreetMap way within 30 m, fetched via the Overpass API.'
+                    : 'No OpenStreetMap match is available for this route, so surface type could not be determined and every steep descent is counted as "rough" by default.'}
+            </p>
+            <button onclick="hideDescentInfo()">Close</button>
+        </div>
+    </div>
+    <div id="trail-strain-modal" class="modal-overlay" onclick="hideTrailStrainInfo()">
+        <div class="modal-box" onclick="event.stopPropagation()">
+            <h2>Trail strain score</h2>
+            <p>${escapeXml(trailStrainReason)}</p>
+            <table>
+                <tr><th>Metric</th><th>This route</th></tr>
+                <tr><td>Effort distance</td><td>${String.format(Locale.ROOT, '%.2f km', effortDistanceKm)}</td></tr>
+                <tr><td>Actual distance</td><td>${String.format(Locale.ROOT, '%.2f km', distanceKm)}</td></tr>
+                <tr><td>Braking load index</td><td>${String.format(Locale.ROOT, '%.0f', totalBrakingIndex)}</td></tr>
+                <tr><td>High-strain descent</td><td>${String.format(Locale.ROOT, '%.2f km', highStrainDescentKm)}</td></tr>
+                <tr><th colspan="2">Surface breakdown (% of distance)</th></tr>
+                ${surfaceBreakdown.collect { entry -> "<tr><td>${escapeXml(entry.surface as String)}</td><td>${String.format(Locale.ROOT, '%.1f%%', entry.pct as double)}</td></tr>" }.join('\n                ')}
+            </table>
+            <p style="font-size: 12px; color: #666;">
+                Toggle the profile above to "Strain intensity" to see where the effort/impact is
+                concentrated along the route, rather than just the raw gradient.
+            </p>
+            <button onclick="hideTrailStrainInfo()">Close</button>
+        </div>
+    </div>
     <script>
         var tooltip = document.getElementById('tooltip');
+        var crosshair = document.getElementById('crosshair');
 
         function showTip(evt) {
             var tip = evt.target.getAttribute('data-tip');
@@ -577,10 +966,31 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             tooltip.style.display = 'block';
             tooltip.style.left = (evt.pageX + 12) + 'px';
             tooltip.style.top = (evt.pageY + 12) + 'px';
+
+            var x = evt.target.getAttribute('data-x');
+            if (x !== null) {
+                crosshair.setAttribute('x1', x);
+                crosshair.setAttribute('x2', x);
+                crosshair.style.display = 'block';
+            }
         }
 
         function hideTip() {
             tooltip.style.display = 'none';
+            crosshair.style.display = 'none';
+        }
+
+        var modeGradient = document.getElementById('mode-gradient');
+        var modeStrain = document.getElementById('mode-strain');
+        var modeGradientBtn = document.getElementById('mode-gradient-btn');
+        var modeStrainBtn = document.getElementById('mode-strain-btn');
+
+        function setColourMode(mode) {
+            var strainActive = mode === 'strain';
+            modeStrain.style.display = strainActive ? 'block' : 'none';
+            modeGradient.style.display = strainActive ? 'none' : 'block';
+            modeStrainBtn.classList.toggle('active', strainActive);
+            modeGradientBtn.classList.toggle('active', !strainActive);
         }
 
         var difficultyModal = document.getElementById('difficulty-modal');
@@ -670,11 +1080,33 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
 
         updateWaterSlider();
 
+        var descentModal = document.getElementById('descent-modal');
+
+        function showDescentInfo() {
+            descentModal.classList.add('open');
+        }
+
+        function hideDescentInfo() {
+            descentModal.classList.remove('open');
+        }
+
+        var trailStrainModal = document.getElementById('trail-strain-modal');
+
+        function showTrailStrainInfo() {
+            trailStrainModal.classList.add('open');
+        }
+
+        function hideTrailStrainInfo() {
+            trailStrainModal.classList.remove('open');
+        }
+
         document.addEventListener('keydown', function (evt) {
             if (evt.key === 'Escape') {
                 hideDifficultyInfo();
                 hideEffortInfo();
                 hideWaterInfo();
+                hideDescentInfo();
+                hideTrailStrainInfo();
             }
         });
     </script>
@@ -711,6 +1143,31 @@ if (points.size() < 2) {
     System.exit(1)
 }
 
+File cacheFile = new File(options.gpxFile.absoluteFile.parentFile, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '.osm.json')
+Map osmData = null
+String matchSource = 'none'
+
+if (!options.noCache && cacheFile.exists()) {
+    osmData = new JsonSlurper().parse(cacheFile) as Map
+    matchSource = 'cache'
+    println "Loaded OpenStreetMap data from local cache: ${cacheFile.name}"
+} else {
+    try {
+        Map bbox = computeBoundingBox(points)
+        String rawJson = fetchOverpassRaw(bbox)
+        cacheFile.text = rawJson
+        osmData = new JsonSlurper().parseText(rawJson) as Map
+        matchSource = 'api'
+        println 'Fetched and cached OpenStreetMap data from Overpass API'
+    } catch (Exception ex) {
+        System.err.println("Overpass API request failed (${ex.message}); continuing without surface/SAC data.")
+    }
+}
+
+List<Map> osmWays = parseOsmWays(osmData)
+Map trailInfo = [matched: !osmWays.isEmpty(), source: matchSource]
+double surfaceSnapThresholdM = 30.0
+
 List<Double> smoothedEle = movingAverage(points.collect { it.ele as double }, options.window)
 for (int i = 0; i < points.size(); i++) {
     points[i].smoothedEle = smoothedEle[i]
@@ -724,13 +1181,34 @@ for (int i = 1; i < points.size(); i++) {
     points[i].distance = cumulative
 }
 
+for (int i = 0; i < points.size(); i++) {
+    Map wayInfo = nearestWayInfo(points[i].lat as double, points[i].lon as double, osmWays, surfaceSnapThresholdM)
+    points[i].surface = wayInfo.surface
+    points[i].sacScale = wayInfo.sacScale
+    points[i].tracktype = wayInfo.tracktype
+    points[i].highway = wayInfo.highway
+    points[i].eta = terrainFactorForSurface(wayInfo.surface as String)
+    points[i].tFactor = technicalFactorForSacScale(wayInfo.sacScale as String)
+}
+
+Set<String> smoothSurfaces = ['paved', 'asphalt'] as Set
+
 double totalAscent = 0.0
 double totalDescent = 0.0
 double maxGrade = 0.0
 double minGradeBaselineM = 10.0
 double maxPlausibleGrade = 100.0
 int clampedGradeCount = 0
+double steepDescentDistanceM = 0.0
+double smoothSteepDescentDistanceM = 0.0
+double roughSteepDescentDistanceM = 0.0
+double totalMetabolicCostM = 0.0
+double totalBrakingIndex = 0.0
+double highStrainDescentDistanceM = 0.0
+Map<String, Double> surfaceDistanceM = [:].withDefault { 0.0 }
 points[0].grade = 0.0
+points[0].strainFactor = 1.0
+points[0].strainIntensity = 1.0
 int gradeRef = 0
 for (int i = 1; i < points.size(); i++) {
     double deltaEle = (points[i].smoothedEle as double) - (points[i - 1].smoothedEle as double)
@@ -757,16 +1235,63 @@ for (int i = 1; i < points.size(); i++) {
     }
     points[i].grade = grade
     maxGrade = Math.max(maxGrade, Math.abs(grade))
+
+    // Mechanical descent strain: a steep, rough (unpaved/unknown surface) descent loads
+    // the quads and knees eccentrically far more than the same gradient on a paved path.
+    double segDist = (points[i].distance as double) - (points[i - 1].distance as double)
+    String surface = (points[i].surface ?: 'unknown') as String
+    if (grade < -15.0) {
+        steepDescentDistanceM += segDist
+        if (smoothSurfaces.contains(surface.toLowerCase())) {
+            smoothSteepDescentDistanceM += segDist
+        } else {
+            roughSteepDescentDistanceM += segDist
+        }
+    }
+    surfaceDistanceM[surface] = (surfaceDistanceM[surface] ?: 0.0) + segDist
+
+    // Multi-factor trail strain model: metabolic cost (Minetti) and eccentric braking
+    // strain, each scaled by the terrain factor (eta) and technical factor (T-factor) at
+    // this point. Grade is stored as a percentage elsewhere, so it is converted to a
+    // fraction here to match the model's expected units.
+    double eta = points[i].eta as double
+    double tFactor = points[i].tFactor as double
+    double gradeFraction = grade / 100.0
+
+    double gradeMult = minettiCostMultiplier(gradeFraction)
+    double metabolicCost = segDist * gradeMult * eta * tFactor
+    totalMetabolicCostM += metabolicCost
+
+    double brakingIntensitySq = 0.0
+    if (gradeFraction < -0.10) {
+        double brakingIntensity = Math.abs(gradeFraction) / 0.10
+        brakingIntensitySq = brakingIntensity * brakingIntensity
+        totalBrakingIndex += segDist * brakingIntensitySq * eta * tFactor
+    }
+
+    if (gradeFraction < -0.15 && eta >= 1.25) {
+        highStrainDescentDistanceM += segDist
+    }
+
+    points[i].strainFactor = gradeMult * eta * tFactor
+    points[i].strainIntensity = eta * tFactor * (gradeMult + brakingIntensitySq)
 }
+
+Map descentStrain = [
+    steepDescentDistanceM: steepDescentDistanceM,
+    smoothSteepDescentDistanceM: smoothSteepDescentDistanceM,
+    roughSteepDescentDistanceM: roughSteepDescentDistanceM
+]
 
 double totalDistanceKm = cumulative / 1000.0
 double durationHours = din33466Duration(totalDistanceKm, totalAscent, totalDescent)
 Map difficultyResult = classifyDifficulty(totalAscent, totalDistanceKm, maxGrade, clampedGradeCount)
 Map shenandoahResult = shenandoahDifficulty(totalAscent, totalDistanceKm)
 Map waterResult = waterIntakeRecommendation(durationHours, options.tempCelsius, options.exposureFactor)
+Map trailStrain = trailStrainSummary(totalMetabolicCostM / 1000.0, totalDistanceKm, totalBrakingIndex, highStrainDescentDistanceM / 1000.0, surfaceDistanceM, cumulative)
 
-printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult)
+printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain)
 
 File output = options.outputPath ? new File(options.outputPath) : new File(options.gpxFile.absoluteFile.parentFile, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '-profile.html')
-output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult)
+output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain)
 println "Elevation profile written to: ${output.absolutePath}"
