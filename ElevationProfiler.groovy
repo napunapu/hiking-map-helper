@@ -37,6 +37,9 @@ class Options {
 
     @Option(names = ['--no-cache'], description = 'Force re-querying the Overpass API even if a cached OpenStreetMap response exists')
     boolean noCache = false
+
+    @Option(names = ['-s', '--speed'], description = 'Base flat walking speed in km/h, used for the effort-adjusted duration model (default: 4.0)')
+    double speedKmh = 4.0
 }
 
 double haversine(double lat1, double lon1, double lat2, double lon2) {
@@ -305,6 +308,45 @@ double din33466Duration(double distanceKm, double ascentM, double descentM) {
     larger + (smaller / 2.0)
 }
 
+// Tobler's hiking function models walking speed (not energy cost) as a function of slope,
+// peaking on a gentle -5% downhill and falling away roughly symmetrically on either side.
+// Unlike a naive inverse-Minetti speed (which would predict speeding up on any downhill,
+// since descending costs less energy up to a point), Tobler's function correctly slows
+// down on steep descents too - matching the real caution/braking a hiker applies on a
+// steep, technical descent regardless of the metabolic saving.
+double toblerSpeedKmh(double gradeFraction) {
+    6.0 * Math.exp(-3.5 * Math.abs(gradeFraction + 0.05))
+}
+
+double slopeSpeedFactor(double gradeFraction) {
+    toblerSpeedKmh(gradeFraction) / toblerSpeedKmh(0.0)
+}
+
+Map durationComparison(double dinDurationHours, double effortDurationHours, double distanceKm, double activeHourlyRate, double baseSpeedKmh) {
+    double reserveVolume = 0.5
+    double dinConsumption = dinDurationHours * activeHourlyRate + reserveVolume
+    double effortConsumption = effortDurationHours * activeHourlyRate + reserveVolume
+    double deltaMinutes = (effortDurationHours - dinDurationHours) * 60.0
+    double dinPaceKmh = dinDurationHours > 0 ? distanceKm / dinDurationHours : 0.0
+    double effortPaceKmh = effortDurationHours > 0 ? distanceKm / effortDurationHours : 0.0
+
+    String reason = String.format(
+        Locale.ROOT,
+        'The effort-adjusted model integrates a per-segment speed derived from Tobler\'s hiking ' +
+        'function (slowing for both steep climbs and steep descents, rather than assuming a fixed ' +
+        '800 m/h descent rate), divided by the terrain factor (eta) and technical factor (T-factor) ' +
+        'at each point from the matched OpenStreetMap surface and SAC scale. Rough or technical ' +
+        'descents are explicitly slowed rather than sped up, unlike a pure energy-cost model.'
+    )
+
+    [
+        dinDurationHours: dinDurationHours, effortDurationHours: effortDurationHours,
+        deltaMinutes: deltaMinutes, dinConsumption: dinConsumption, effortConsumption: effortConsumption,
+        dinPaceKmh: dinPaceKmh, effortPaceKmh: effortPaceKmh, reserveVolume: reserveVolume,
+        baseSpeedKmh: baseSpeedKmh, reason: reason
+    ]
+}
+
 Map classifyDifficulty(double ascentM, double distanceKm, double maxGrade, int clampedGradeCount) {
     double ascentPerKm = distanceKm > 0 ? ascentM / distanceKm : 0.0
     double moderateMaxGrade = 12.0
@@ -444,12 +486,17 @@ String formatDuration(double hours) {
     String.format(Locale.ROOT, '%dh %02dmin', h, m)
 }
 
-void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain) {
+void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult) {
     println '=== Elevation profile summary ==='
     println String.format(Locale.ROOT, 'Total distance : %.2f km', distanceKm)
     println String.format(Locale.ROOT, 'Total ascent   : %.0f m', ascent)
     println String.format(Locale.ROOT, 'Total descent  : %.0f m', descent)
-    println "Estimated time  : ${formatDuration(durationHours)} (DIN 33466)"
+    double deltaMinutes = durationResult.deltaMinutes as double
+    String deltaSign = deltaMinutes >= 0 ? '+' : '-'
+    println "DIN 33466 duration       : ${formatDuration(durationResult.dinDurationHours as double)}"
+    println "Effort-adjusted duration : ${formatDuration(durationResult.effortDurationHours as double)} (delta: ${deltaSign}${Math.round(Math.abs(deltaMinutes)) as int} min)"
+    println String.format(Locale.ROOT, 'DIN hydration need       : %.1f L', durationResult.dinConsumption as double)
+    println String.format(Locale.ROOT, 'Effort-adjusted hydration: %.1f L', durationResult.effortConsumption as double)
     println "Trail data      : ${trailInfo.matched ? 'Matched to OpenStreetMap (surface/SAC scale available)' : 'Raw GPX (no OSM match; surface/SAC scale unknown)'}"
     println "Difficulty      : ${difficultyResult.tier}"
     println "Reason          : ${difficultyResult.reason}"
@@ -579,7 +626,7 @@ String buildWaterChart(List<Map> chartData, double maxScaleLitres) {
 ${bars}</svg>"""
 }
 
-String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain) {
+String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult) {
     String difficulty = difficultyResult.tier
     String difficultyReason = difficultyResult.reason
     double maxGrade = difficultyResult.maxGrade as double
@@ -611,6 +658,16 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     double highStrainDescentKm = trailStrain.highStrainDescentKm as double
     String trailStrainReason = trailStrain.reason
     List<Map> surfaceBreakdown = trailStrain.surfaceBreakdown as List<Map>
+    double durationDinHours = durationResult.dinDurationHours as double
+    double durationEffortHours = durationResult.effortDurationHours as double
+    double durationDeltaMinutes = durationResult.deltaMinutes as double
+    double durationDinConsumption = durationResult.dinConsumption as double
+    double durationEffortConsumption = durationResult.effortConsumption as double
+    double durationDinPaceKmh = durationResult.dinPaceKmh as double
+    double durationEffortPaceKmh = durationResult.effortPaceKmh as double
+    double durationBaseSpeedKmh = durationResult.baseSpeedKmh as double
+    double durationReserveVolume = durationResult.reserveVolume as double
+    String durationReason = durationResult.reason
     int width = 1100
     int height = 420
     int padding = 50
@@ -703,6 +760,16 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         }
         .summary strong {
             font-size: 16px;
+        }
+        .summary strong span {
+            font-size: inherit;
+            font-weight: inherit;
+            color: inherit;
+        }
+        .trail-data-note {
+            font-size: 12px;
+            color: #777;
+            margin: 6px 0 18px;
         }
         .clickable {
             cursor: pointer;
@@ -819,11 +886,11 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         <div><span>Distance</span><strong>${String.format(Locale.ROOT, '%.2f km', distanceKm)}</strong></div>
         <div><span>Ascent</span><strong>${String.format(Locale.ROOT, '%.0f m', ascent)}</strong></div>
         <div><span>Descent</span><strong>${String.format(Locale.ROOT, '%.0f m', descent)}</strong></div>
-        <div><span>Estimated time</span><strong>${formatDuration(durationHours)}</strong></div>
+        <div><span>Duration (DIN 33466)</span><strong>${formatDuration(durationDinHours)} (${String.format(Locale.ROOT, '%.1f km/h', durationDinPaceKmh)})</strong></div>
+        <div><span>Duration (terrain adjusted)</span><strong class="clickable" onclick="showDurationInfo()"><span id="duration-tile-value">${formatDuration(durationEffortHours)} (${String.format(Locale.ROOT, '%.1f km/h', durationEffortPaceKmh)})</span> &#9432;</strong></div>
         <div><span>Difficulty</span><strong class="clickable" onclick="showDifficultyInfo()">${difficulty} &#9432;</strong></div>
         <div><span>Effort (Shenandoah)</span><strong class="clickable" onclick="showEffortInfo()">${effortTier} &#9432;</strong></div>
-        <div><span>Water (at ${Math.round(waterTempCelsius) as int}&deg;C)</span><strong class="clickable" onclick="showWaterInfo()">${String.format(Locale.ROOT, '%.1f L', waterRecommendedCarry)} &#9432;</strong></div>
-        <div><span>Trail data</span><strong>${trailMatched ? 'OSM-matched' : 'Raw GPX'}</strong></div>
+        <div><span>Water (at <span id="water-tile-temp">${Math.round(waterTempCelsius) as int}</span>&deg;C)</span><strong class="clickable" onclick="showWaterInfo()"><span id="water-tile-value">${String.format(Locale.ROOT, '%.1f L', waterRecommendedCarry)}</span> &#9432;</strong></div>
         <div><span>Steep descent</span><strong class="clickable" onclick="showDescentInfo()">${String.format(Locale.ROOT, '%.2f km', steepDescentKm)} &#9432;</strong></div>
         <div><span>Trail strain</span><strong class="clickable" onclick="showTrailStrainInfo()">${String.format(Locale.ROOT, '%.0f/100', trailStrainScore)} &#9432;</strong></div>
     </div>
@@ -848,6 +915,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         </svg>
         <div id="tooltip"></div>
     </div>
+    <p class="trail-data-note">${trailMatched ? 'Trail data: matched to OpenStreetMap (surface/SAC scale available).' : 'Trail data: no OpenStreetMap match (surface/SAC scale unknown).'}</p>
     <div id="difficulty-modal" class="modal-overlay" onclick="hideDifficultyInfo()">
         <div class="modal-box" onclick="event.stopPropagation()">
             <h2>Why "${difficulty}"?</h2>
@@ -956,6 +1024,28 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             <button onclick="hideTrailStrainInfo()">Close</button>
         </div>
     </div>
+    <div id="duration-modal" class="modal-overlay" onclick="hideDurationInfo()">
+        <div class="modal-box" onclick="event.stopPropagation()">
+            <h2>Duration models compared</h2>
+            <p>${escapeXml(durationReason)}</p>
+            <div class="water-slider-row">
+                <label for="speed-slider">Base flat walking speed (<span id="speed-value">${String.format(Locale.ROOT, '%.1f', durationBaseSpeedKmh)}</span> km/h)</label>
+                <input type="range" id="speed-slider" min="2.5" max="6.5" step="0.1" value="${String.format(Locale.ROOT, '%.1f', durationBaseSpeedKmh)}" oninput="updateDurationSlider()" />
+            </div>
+            <table>
+                <tr><th>Metric</th><th>Standard DIN 33466</th><th>OSM Terrain &amp; Grade Adjusted</th></tr>
+                <tr><td>Duration</td><td>${formatDuration(durationDinHours)}</td><td><span id="duration-effort-value">${formatDuration(durationEffortHours)}</span></td></tr>
+                <tr><td>Pace</td><td>${String.format(Locale.ROOT, '%.1f km/h', durationDinPaceKmh)}</td><td><span id="duration-effort-pace">${String.format(Locale.ROOT, '%.1f km/h', durationEffortPaceKmh)}</span></td></tr>
+                <tr><td>Hydration need (incl. ${String.format(Locale.ROOT, '%.1f', durationReserveVolume)} L reserve)</td><td>${String.format(Locale.ROOT, '%.1f L', durationDinConsumption)}</td><td><span id="duration-effort-consumption">${String.format(Locale.ROOT, '%.1f L', durationEffortConsumption)}</span></td></tr>
+            </table>
+            <p id="duration-delta-text" style="font-size: 12px; color: #666;">
+                ${durationDeltaMinutes >= 0
+                    ? "The terrain-adjusted estimate is ${Math.round(durationDeltaMinutes) as int} min longer than DIN 33466."
+                    : "The terrain-adjusted estimate is ${Math.round(-durationDeltaMinutes) as int} min shorter than DIN 33466."}
+            </p>
+            <button onclick="hideDurationInfo()">Close</button>
+        </div>
+    </div>
     <script>
         var tooltip = document.getElementById('tooltip');
         var crosshair = document.getElementById('crosshair');
@@ -1013,6 +1103,40 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             effortModal.classList.remove('open');
         }
 
+        // Shared state and persistence for the water and duration sliders: changing one
+        // keeps the other's dependent figures (and the header tiles) in sync, and both are
+        // saved together so a reopened report remembers the last-used settings.
+        var currentActiveHourlyRate = ${String.format(Locale.ROOT, '%.4f', waterActiveHourlyRate)};
+        var PREFS_KEY = 'elevationProfilerPrefs';
+
+        function loadPrefs() {
+            try {
+                var raw = localStorage.getItem(PREFS_KEY);
+                return raw ? JSON.parse(raw) : {};
+            } catch (e) {
+                return {};
+            }
+        }
+
+        function savePrefs() {
+            try {
+                localStorage.setItem(PREFS_KEY, JSON.stringify({
+                    tempC: parseFloat(tempSlider.value),
+                    exposureChecked: exposureToggle.checked,
+                    speedKmh: parseFloat(speedSlider.value)
+                }));
+            } catch (e) {
+                // localStorage may be unavailable in some contexts; settings simply won't persist.
+            }
+        }
+
+        function formatDurationJs(hours) {
+            var totalMinutes = Math.round(hours * 60);
+            var h = Math.floor(totalMinutes / 60);
+            var m = totalMinutes % 60;
+            return h + 'h ' + (m < 10 ? '0' : '') + m + 'min';
+        }
+
         var waterModal = document.getElementById('water-modal');
         var waterDurationHours = ${String.format(Locale.ROOT, '%.4f', durationHours)};
         var waterReserveVolume = ${String.format(Locale.ROOT, '%.2f', waterReserveVolume)};
@@ -1048,6 +1172,9 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         var waterConsumptionEl = document.getElementById('water-consumption');
         var waterValueEl = document.getElementById('water-value');
 
+        var waterTileTempEl = document.getElementById('water-tile-temp');
+        var waterTileValueEl = document.getElementById('water-tile-value');
+
         function updateWaterSlider() {
             var tempC = parseFloat(tempSlider.value);
             var exposureFactor = exposureToggle.checked ? 1.1 : 1.0;
@@ -1059,6 +1186,8 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             waterRateEl.textContent = activeHourlyRate.toFixed(2);
             waterConsumptionEl.textContent = consumption.toFixed(1);
             waterValueEl.textContent = recommendedCarry.toFixed(1);
+            waterTileTempEl.textContent = tempC.toFixed(0);
+            waterTileValueEl.textContent = recommendedCarry.toFixed(1) + ' L';
 
             for (var i = 0; i < waterChartTemps.length; i++) {
                 var chartTemp = parseFloat(waterChartTemps[i]);
@@ -1076,9 +1205,11 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
                     label.setAttribute('y', waterChartHeight - waterChartBaselinePad - barHeight - 5);
                 }
             }
-        }
 
-        updateWaterSlider();
+            currentActiveHourlyRate = activeHourlyRate;
+            savePrefs();
+            updateDurationSlider();
+        }
 
         var descentModal = document.getElementById('descent-modal');
 
@@ -1100,6 +1231,68 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             trailStrainModal.classList.remove('open');
         }
 
+        var durationModal = document.getElementById('duration-modal');
+
+        function showDurationInfo() {
+            durationModal.classList.add('open');
+        }
+
+        function hideDurationInfo() {
+            durationModal.classList.remove('open');
+        }
+
+        // The effort-adjusted duration is exactly inversely proportional to the base speed
+        // (every segment's time is distance / (base_speed * slope_factor / (eta * T-factor)),
+        // and base_speed factors out of the whole sum), so the slider can rescale the
+        // server-computed duration directly without re-integrating every segment in JS.
+        var durationBaseSpeedKmh = ${String.format(Locale.ROOT, '%.2f', durationBaseSpeedKmh)};
+        var durationBaseEffortHours = ${String.format(Locale.ROOT, '%.4f', durationEffortHours)};
+        var durationDinHoursJs = ${String.format(Locale.ROOT, '%.4f', durationDinHours)};
+        var durationDistanceKmJs = ${String.format(Locale.ROOT, '%.2f', distanceKm)};
+        var durationReserveVolumeJs = ${String.format(Locale.ROOT, '%.2f', durationReserveVolume)};
+
+        var speedSlider = document.getElementById('speed-slider');
+        var speedValueEl = document.getElementById('speed-value');
+        var durationEffortValueEl = document.getElementById('duration-effort-value');
+        var durationEffortPaceEl = document.getElementById('duration-effort-pace');
+        var durationEffortConsumptionEl = document.getElementById('duration-effort-consumption');
+        var durationDeltaTextEl = document.getElementById('duration-delta-text');
+        var durationTileValueEl = document.getElementById('duration-tile-value');
+
+        function updateDurationSlider() {
+            var speedKmh = parseFloat(speedSlider.value);
+            var effortHours = durationBaseEffortHours * (durationBaseSpeedKmh / speedKmh);
+            var effortPaceKmh = effortHours > 0 ? durationDistanceKmJs / effortHours : 0;
+            var effortConsumption = effortHours * currentActiveHourlyRate + durationReserveVolumeJs;
+            var deltaMinutes = (effortHours - durationDinHoursJs) * 60;
+
+            speedValueEl.textContent = speedKmh.toFixed(1);
+            durationEffortValueEl.textContent = formatDurationJs(effortHours);
+            durationEffortPaceEl.textContent = effortPaceKmh.toFixed(1) + ' km/h';
+            durationEffortConsumptionEl.textContent = effortConsumption.toFixed(1) + ' L';
+            durationDeltaTextEl.textContent = deltaMinutes >= 0
+                ? 'The terrain-adjusted estimate is ' + Math.round(deltaMinutes) + ' min longer than DIN 33466.'
+                : 'The terrain-adjusted estimate is ' + Math.round(-deltaMinutes) + ' min shorter than DIN 33466.';
+            durationTileValueEl.textContent = formatDurationJs(effortHours) + ' (' + effortPaceKmh.toFixed(1) + ' km/h)';
+
+            savePrefs();
+        }
+
+        // Restore any previously saved slider settings before the first render, then
+        // refresh every dependent value (water tile, duration tile, both modals) once so
+        // everything on screen is consistent with the restored state from the start.
+        var savedPrefs = loadPrefs();
+        if (typeof savedPrefs.tempC === 'number') {
+            tempSlider.value = savedPrefs.tempC;
+        }
+        if (typeof savedPrefs.exposureChecked === 'boolean') {
+            exposureToggle.checked = savedPrefs.exposureChecked;
+        }
+        if (typeof savedPrefs.speedKmh === 'number') {
+            speedSlider.value = savedPrefs.speedKmh;
+        }
+        updateWaterSlider();
+
         document.addEventListener('keydown', function (evt) {
             if (evt.key === 'Escape') {
                 hideDifficultyInfo();
@@ -1107,6 +1300,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
                 hideWaterInfo();
                 hideDescentInfo();
                 hideTrailStrainInfo();
+                hideDurationInfo();
             }
         });
     </script>
@@ -1205,6 +1399,7 @@ double roughSteepDescentDistanceM = 0.0
 double totalMetabolicCostM = 0.0
 double totalBrakingIndex = 0.0
 double highStrainDescentDistanceM = 0.0
+double totalEffortDurationHours = 0.0
 Map<String, Double> surfaceDistanceM = [:].withDefault { 0.0 }
 points[0].grade = 0.0
 points[0].strainFactor = 1.0
@@ -1275,6 +1470,12 @@ for (int i = 1; i < points.size(); i++) {
 
     points[i].strainFactor = gradeMult * eta * tFactor
     points[i].strainIntensity = eta * tFactor * (gradeMult + brakingIntensitySq)
+
+    // Effort-adjusted duration: integrate a per-segment speed (Tobler's hiking function,
+    // scaled by the same terrain/technical factors) rather than DIN 33466's fixed rates.
+    double slopeFactor = slopeSpeedFactor(gradeFraction)
+    double vSegKmh = options.speedKmh * slopeFactor / (eta * tFactor)
+    totalEffortDurationHours += (segDist / 1000.0) / vSegKmh
 }
 
 Map descentStrain = [
@@ -1289,9 +1490,10 @@ Map difficultyResult = classifyDifficulty(totalAscent, totalDistanceKm, maxGrade
 Map shenandoahResult = shenandoahDifficulty(totalAscent, totalDistanceKm)
 Map waterResult = waterIntakeRecommendation(durationHours, options.tempCelsius, options.exposureFactor)
 Map trailStrain = trailStrainSummary(totalMetabolicCostM / 1000.0, totalDistanceKm, totalBrakingIndex, highStrainDescentDistanceM / 1000.0, surfaceDistanceM, cumulative)
+Map durationResult = durationComparison(durationHours, totalEffortDurationHours, totalDistanceKm, waterResult.activeHourlyRate as double, options.speedKmh)
 
-printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain)
+printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult)
 
 File output = options.outputPath ? new File(options.outputPath) : new File(options.gpxFile.absoluteFile.parentFile, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '-profile.html')
-output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain)
+output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult)
 println "Elevation profile written to: ${output.absolutePath}"

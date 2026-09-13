@@ -15,7 +15,7 @@ OpenStreetMap.
 ## Usage
 
 ```sh
-groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>] [--no-cache]
+groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>] [-s <speed>] [--no-cache]
 ```
 
 | Option | Description | Default |
@@ -24,6 +24,7 @@ groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t
 | `-o`, `--output` | Output HTML file path | `<input>-profile.html` |
 | `-t`, `--temp` | Forecast max ambient temperature in shade, in °C | `20.0` |
 | `-e`, `--exposure` | Route shading factor: `1.0` forest/partial shade, `1.1` fully exposed ridges | `1.0` |
+| `-s`, `--speed` | Base flat walking speed in km/h, for the effort-adjusted duration model | `4.0` |
 | `--no-cache` | Force re-querying the Overpass API even if a cached response exists | `false` |
 | `-h`, `--help` | Show usage and exit | |
 | `-V`, `--version` | Show version and exit | |
@@ -49,9 +50,39 @@ This prints a summary to the console and writes
   implausible on foot) is capped, and the difficulty explanation below notes
   when that happened.
 - **Ascent / descent**: summed from the smoothed elevation profile.
-- **Estimated duration**: the DIN 33466 hiking formula (4 km/h horizontal,
-  400 m/h ascent, 800 m/h descent; the larger of the horizontal/vertical
-  time plus half of the smaller).
+
+## Duration models
+
+Two independent duration estimates are shown side by side, since they model
+moving time very differently:
+
+1. **Standard DIN 33466** — the fixed hiking-time standard (4 km/h
+   horizontal, 400 m/h ascent, 800 m/h descent; the larger of the
+   horizontal/vertical time plus half of the smaller). Always uses the
+   standard 4 km/h regardless of `-s`/`--speed`, since it's a fixed
+   reference formula, not a tunable model.
+2. **OSM Terrain & Grade Adjusted** — integrates a walking speed per
+   segment: `v_seg = base_speed * slope_factor / (eta * T-factor)`, where
+   `slope_factor` comes from [Tobler's hiking function](https://en.wikipedia.org/wiki/Tobler%27s_hiking_function)
+   (peaking on a gentle -5% downhill, then falling away on both steeper
+   climbs *and* steeper descents). Unlike DIN's fixed 800 m/h descent rate,
+   this explicitly slows down on rough or technical descents rather than
+   assuming descending is always fast — matching real foot-placement
+   braking rather than a pure energy-cost model (which would otherwise
+   predict speeding up on a downhill, since it costs less energy). `eta`
+   and the technical factor are the same per-point values used by the
+   Trail strain model below. `base_speed` defaults to 4.0 km/h and is
+   configurable via `-s`/`--speed`.
+
+Hydration need is computed under both models (duration × the calibrated
+Zone 2 burn rate, plus the 0.5 L reserve), and the console/HTML both show
+the difference between the two duration estimates.
+
+In the HTML, the "OSM Terrain & Grade Adjusted" tile's popup has a base
+speed slider (since the model is exactly proportional to it, the browser
+just rescales the server-computed duration rather than re-integrating every
+segment). See "Interactive sliders" below for how this and the water
+slider interact and persist.
 
 ## Difficulty ratings
 
@@ -100,6 +131,26 @@ also shows:
 
 This is general guidance, not personalised medical advice — individual
 needs vary with body size, fitness and health.
+
+## Interactive sliders
+
+The temperature/exposure slider (Water tile) and the base-speed slider
+(Duration tile) are linked and persisted:
+
+- Changing either slider updates its own popup **and** the corresponding
+  header tile immediately — you don't need to keep the popup open to see
+  the new figure.
+- The two are one-directionally linked: temperature/exposure feed into the
+  hourly hydration rate, which the duration popup's hydration-need figures
+  also use, so changing temperature updates those too. Changing base speed
+  only affects duration/pace, not the Water tile.
+- All three settings (temperature, exposure, base speed) are saved to the
+  browser's `localStorage` on every change, and restored automatically the
+  next time the same report file is opened in the same browser — reopening
+  it shows your last-used settings rather than the defaults it was
+  generated with. This is per-browser, per-file storage: it doesn't sync
+  anywhere, and re-running the script overwrites the file's content but
+  not a browser's already-stored preferences for it.
 
 ## Trail surface via OpenStreetMap
 
