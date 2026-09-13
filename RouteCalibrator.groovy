@@ -251,6 +251,35 @@ String surfaceBracketFor(String surface) {
 
 List<String> SURFACE_BRACKET_ORDER = ['Paved', 'Track/dirt', 'Rough/unpaved']
 
+// A coarser 3-way split used only by the hierarchical calibration pipeline: "Firm" widens the
+// diagnostic report's "Paved" bucket to also include compacted/fine_gravel/hard, since those
+// surfaces support the same confident, even foot-strike pace that the flat-speed and
+// slope-response stages need to isolate cleanly from surface friction.
+String firmnessBracketFor(String surface) {
+    String s = (surface ?: 'unknown').toLowerCase()
+    Set<String> firm = ['asphalt', 'concrete', 'paved', 'paving_stones', 'compacted', 'fine_gravel', 'hard'] as Set
+    Set<String> rough = ['gravel', 'unpaved', 'stones', 'pebbles', 'rock', 'scree', 'sand', 'boulders'] as Set
+    if (firm.contains(s)) {
+        return 'Firm'
+    }
+    if (rough.contains(s)) {
+        return 'Rough/loose'
+    }
+    'Standard trail'
+}
+
+List<String> FIRMNESS_BRACKET_ORDER = ['Firm', 'Standard trail', 'Rough/loose']
+
+double median(List<Double> values) {
+    if (values.isEmpty()) {
+        return 0.0
+    }
+    List<Double> sorted = values.sort(false)
+    int n = sorted.size()
+    int mid = n.intdiv(2)
+    (n % 2 == 0) ? (sorted[mid - 1] + sorted[mid]) / 2.0 : sorted[mid]
+}
+
 Map parseBreakSpec(String spec) {
     List<String> parts = spec.tokenize(':')
     if (parts.size() != 2) {
@@ -836,68 +865,177 @@ if (!lowFloorPoints.isEmpty()) {
     println '- No planned points predict an unrealistically low (< 2.5 km/h) floor speed.'
 }
 
-println ''
-println '--- Recommended calibration adjustments ---'
-double globalActualSpeed = avgSpeedKmh((recordedModel.totalDistanceKm as double) * 1000.0, (recordedModel.totalMovingTimeHours as double) * 3600.0)
-double globalPredictedSpeed = avgSpeedKmh((plannedModel.totalDistanceKm as double) * 1000.0, (plannedModel.predictedTotalHours as double) * 3600.0)
-double baseSpeedRatio = (flatActual > 0 && flatPredicted > 0) ? flatActual / flatPredicted : (globalPredictedSpeed > 0 ? globalActualSpeed / globalPredictedSpeed : 1.0)
-double suggestedBaseSpeed = options.speedKmh * baseSpeedRatio
-println String.format(Locale.ROOT, 'Suggested baseline flat speed (-s): %.2f km/h (currently %.2f km/h)', suggestedBaseSpeed, options.speedKmh)
+// ----- hierarchical 3-stage residual calibration -----
+// Each stage is locked in turn against matched, on-route, moving segments only (excluding the
+// route deviation and stationary pauses detected above), so later stages solve residuals
+// against an already-fixed earlier stage instead of three independent heuristics compounding
+// multiplicatively - which is what previously drove the calibrated prediction from +36.3% past
+// zero to -19.8% instead of converging.
 
-// Eta is revised against the ALREADY-corrected baseline speed (not the original -s), since
-// the two adjustments are applied together in the verification pass below - correcting eta
-// against the original base speed would double-count the same gap that suggestedBaseSpeed
-// has already closed.
-double baseSpeedCorrectionRatio = suggestedBaseSpeed / options.speedKmh
-println 'Suggested revised terrain multipliers (eta), by surface bracket:'
-SURFACE_BRACKET_ORDER.each { bracket ->
-    double distM = surfaceActualDistM[bracket] ?: 0.0
-    if (distM <= 0) {
-        return
+println ''
+println '--- Hierarchical calibration (3-stage residual solver) ---'
+
+// Shared dataset for all three stages: (grade, speed, firmness) for every matched, on-route,
+// moving recorded segment.
+List<Map> onRouteSamples = []
+for (int i = 1; i < recordedPoints.size(); i++) {
+    Map rp = recordedPoints[i]
+    if (!(rp.moving as boolean) || (rp.snapDistanceM as double) > routeDeviationThresholdM) {
+        continue
     }
-    double actual = avgSpeedKmh(distM, surfaceActualTimeS[bracket] ?: 0.0)
-    double predicted = avgSpeedKmh(distM, surfacePredictedTimeS[bracket] ?: 0.0) * baseSpeedCorrectionRatio
-    double currentEta = (surfaceEtaDistM[bracket] ?: 0.0) > 0 ? (surfaceEtaSum[bracket] as double) / (surfaceEtaDistM[bracket] as double) : 1.0
-    double revisedEta = (actual > 0 && predicted > 0) ? currentEta * (predicted / actual) : currentEta
-    println String.format(Locale.ROOT, '  - %-14s current eta ~%.2f -> suggested ~%.2f', bracket, currentEta, revisedEta)
+    double segDist = (rp.distance as double) - (recordedPoints[i - 1].distance as double)
+    double segTimeS = java.time.Duration.between(recordedPoints[i - 1].time as Instant, rp.time as Instant).toMillis() / 1000.0
+    if (segDist <= 0 || segTimeS <= 0) {
+        continue
+    }
+    Map pp = plannedPoints[rp.plannedIdx as int]
+    onRouteSamples << [
+        grade: rp.grade as double, speedKmh: (segDist / 1000.0) / (segTimeS / 3600.0),
+        firmness: firmnessBracketFor(pp.surface as String)
+    ]
 }
 
-double severeDescentRatio = (severeDescentActual > 0 && severeDescentPredicted > 0) ? severeDescentPredicted / severeDescentActual : 1.0
-double moderateDescentActual = avgSpeedKmh(gradientActualDistM['Moderate descent (-15% to -5%)'] ?: 0.0, gradientActualTimeS['Moderate descent (-15% to -5%)'] ?: 0.0)
-double moderateDescentPredicted = avgSpeedKmh(gradientActualDistM['Moderate descent (-15% to -5%)'] ?: 0.0, gradientPredictedTimeS['Moderate descent (-15% to -5%)'] ?: 0.0)
-double moderateDescentRatio = (moderateDescentActual > 0 && moderateDescentPredicted > 0) ? moderateDescentPredicted / moderateDescentActual : 1.0
-println String.format(Locale.ROOT, 'Suggested descent braking damping factor: severe descents x%.2f, moderate descents x%.2f (multiply the current Tobler-derived slope factor by this on negative grades to correct over/under-braking)', 1.0 / severeDescentRatio, 1.0 / moderateDescentRatio)
+// Stage 1: lock the baseline flat speed on firm terrain (-3% to +3% grade). This is the one
+// number every later stage is expressed relative to.
+List<Double> flatFirmSpeeds = onRouteSamples.findAll {
+    it.firmness == 'Firm' && (it.grade as double) >= -3.0 && (it.grade as double) <= 3.0
+}.collect { it.speedKmh as double }
+double vBaseCalibrated = flatFirmSpeeds.isEmpty() ? options.speedKmh : median(flatFirmSpeeds)
 
-// Verification pass: re-apply the suggested base speed, per-surface-bracket eta correction,
-// and descent braking damping to every planned segment, and report how close the
-// recalculated total comes to actual.
+println ''
+println 'Step 1 - baseline flat speed (firm terrain, -3% to +3% grade):'
+println String.format(Locale.ROOT, '  %d matching segment(s) -> calibrated v_base = %.2f km/h (raw model used %.2f km/h)', flatFirmSpeeds.size(), vBaseCalibrated, options.speedKmh)
+
+// Stage 2: slope response and descent ceiling, still firm terrain only, v_base now fixed.
+double descentSpeedCeilingKmh = 5.2
+
+Closure<Map> lockSlopeAnchor = { String label, Closure<Boolean> gradeFilter ->
+    List<Map> matches = onRouteSamples.findAll { it.firmness == 'Firm' && gradeFilter(it.grade as double) }
+    if (matches.isEmpty()) {
+        return null
+    }
+    [
+        label: label, grade: median(matches.collect { it.grade as double }),
+        speedKmh: median(matches.collect { it.speedKmh as double }), sampleCount: matches.size()
+    ]
+}
+
+Map severeDescentAnchor = lockSlopeAnchor('Severe descent', { double g -> g < -15.0 })
+Map moderateDescentAnchor = lockSlopeAnchor('Moderate descent', { double g -> g >= -15.0 && g < -5.0 })
+Map moderateClimbAnchor = lockSlopeAnchor('Moderate climb', { double g -> g > 5.0 && g <= 15.0 })
+Map severeClimbAnchor = lockSlopeAnchor('Severe climb', { double g -> g > 15.0 })
+
+// A hiker's downhill cadence does not keep accelerating with grade - foot placement and
+// control, not metabolic cost, become the limiting factor. Enforce a hard walking-speed
+// ceiling on the descent anchors so the calibrated curve reflects that physical limit rather
+// than whatever an occasionally sparse sample median happened to show.
+[severeDescentAnchor, moderateDescentAnchor].each { anchor ->
+    if (anchor != null && (anchor.speedKmh as double) > descentSpeedCeilingKmh) {
+        anchor.speedKmh = descentSpeedCeilingKmh
+    }
+}
+
+println ''
+println String.format(Locale.ROOT, 'Step 2 - slope response on firm terrain (descent speed ceiling: %.1f km/h):', descentSpeedCeilingKmh)
+[severeDescentAnchor, moderateDescentAnchor, moderateClimbAnchor, severeClimbAnchor].each { anchor ->
+    if (anchor == null) {
+        return
+    }
+    double rawPredictedSpeed = options.speedKmh * slopeSpeedFactor((anchor.grade as double) / 100.0)
+    double dampingFactor = rawPredictedSpeed > 0 ? (anchor.speedKmh as double) / rawPredictedSpeed : 1.0
+    println String.format(Locale.ROOT, '  %-16s grade %+5.1f%% -> calibrated %.2f km/h (%d samples, x%.2f vs raw Tobler-based model)',
+        anchor.label, anchor.grade as double, anchor.speedKmh as double, anchor.sampleCount as int, dampingFactor)
+}
+
+// Anchor points for the calibrated slope-response curve, as (grade %, speed factor relative
+// to v_base), sorted by grade and pinned flat at (0, 1.0) since v_base is that point by
+// construction. A bracket with no firm samples falls back to the theoretical Tobler ratio at
+// a representative grade (flagged above by its absence from the step 2 listing).
+List<Map> slopeAnchors = [
+    [grade: -20.0, factor: slopeSpeedFactor(-0.20)], [grade: -10.0, factor: slopeSpeedFactor(-0.10)],
+    [grade: 0.0, factor: 1.0],
+    [grade: 10.0, factor: slopeSpeedFactor(0.10)], [grade: 20.0, factor: slopeSpeedFactor(0.20)]
+]
+[severeDescentAnchor, moderateDescentAnchor, moderateClimbAnchor, severeClimbAnchor].each { anchor ->
+    if (anchor == null || vBaseCalibrated <= 0) {
+        return
+    }
+    double grade = anchor.grade as double
+    slopeAnchors.removeAll { Math.abs((it.grade as double) - grade) < 0.01 }
+    slopeAnchors << [grade: grade, factor: (anchor.speedKmh as double) / vBaseCalibrated]
+}
+slopeAnchors = slopeAnchors.sort { it.grade as double }
+
+Closure<Double> calibratedSlopeFactor = { double grade ->
+    if (grade <= (slopeAnchors[0].grade as double)) {
+        return slopeAnchors[0].factor as double
+    }
+    if (grade >= (slopeAnchors[-1].grade as double)) {
+        return slopeAnchors[-1].factor as double
+    }
+    for (int i = 1; i < slopeAnchors.size(); i++) {
+        double g1 = slopeAnchors[i].grade as double
+        if (grade <= g1) {
+            double g0 = slopeAnchors[i - 1].grade as double
+            double f0 = slopeAnchors[i - 1].factor as double
+            double f1 = slopeAnchors[i].factor as double
+            double frac = g1 > g0 ? (grade - g0) / (g1 - g0) : 0.0
+            return f0 + (f1 - f0) * frac
+        }
+    }
+    slopeAnchors[-1].factor as double
+}
+
+// Stage 3: surface friction (eta) as a pure residual - v_base and the slope curve are now
+// locked, so whatever gap remains on non-firm terrain is attributed entirely to surface eta.
+println ''
+println 'Step 3 - residual surface friction (eta), v_base and slope curve now locked:'
+Map etaCalibrated = [Firm: 1.0]
+['Standard trail', 'Rough/loose'].each { firmness ->
+    List<Map> samples = onRouteSamples.findAll { it.firmness == firmness }
+    if (samples.isEmpty()) {
+        etaCalibrated[firmness] = 1.2
+        println String.format(Locale.ROOT, '  %-14s no matching on-route segments - keeping a default eta of 1.20', firmness)
+        return
+    }
+    List<Double> ratios = samples.collect { Map sample ->
+        double expectedFirmSpeed = vBaseCalibrated * calibratedSlopeFactor(sample.grade as double)
+        double actualSpeed = sample.speedKmh as double
+        actualSpeed > 0 ? expectedFirmSpeed / actualSpeed : 1.0
+    }
+    double rawEta = median(ratios)
+    double clampedEta = Math.max(1.05, Math.min(1.60, rawEta))
+    etaCalibrated[firmness] = clampedEta
+    double meanActualSpeed = (samples.collect { it.speedKmh as double }.sum() as double) / samples.size()
+    String clampNote = Math.abs(rawEta - clampedEta) > 0.001 ? String.format(Locale.ROOT, ' (clamped from %.2f)', rawEta) : ''
+    println String.format(Locale.ROOT, '  %-14s %d samples, mean actual %.1f km/h -> eta_calibrated = %.2f%s', firmness, samples.size(), meanActualSpeed, clampedEta, clampNote)
+}
+println String.format(Locale.ROOT, '  %-14s locked as the step 1/2 reference surface -> eta_calibrated = %.2f', 'Firm', etaCalibrated['Firm'] as double)
+
+// ----- verification: rebuild the full-route prediction from the locked parameter set -----
+// v_base is measured from the actual recorded day, so it already embeds whatever
+// thermal/fatigue conditions applied then - reapplying the constant-temperature thermal
+// scalar on top would double-count that effect, so it is intentionally left out here (unlike
+// the raw/uncalibrated model above, which uses the theoretical -s speed and still needs it).
 double calibratedTotalHours = 0.0
 for (int i = 1; i < plannedPoints.size(); i++) {
     Map pp = plannedPoints[i]
     Map prevPp = plannedPoints[i - 1]
     double segDistKm = ((pp.distance as double) - (prevPp.distance as double)) / 1000.0
-    double grade = pp.grade as double
-    double slopeFactor = slopeSpeedFactor(grade / 100.0)
-    if (grade < -15.0) {
-        slopeFactor *= (1.0 / severeDescentRatio)
-    } else if (grade < -5.0) {
-        slopeFactor *= (1.0 / moderateDescentRatio)
-    }
-    String bracket = surfaceBracketFor(pp.surface as String)
-    double distM = surfaceActualDistM[bracket] ?: 0.0
-    double actual = avgSpeedKmh(distM, surfaceActualTimeS[bracket] ?: 0.0)
-    double predicted = avgSpeedKmh(distM, surfacePredictedTimeS[bracket] ?: 0.0) * baseSpeedCorrectionRatio
-    double currentEta = (surfaceEtaDistM[bracket] ?: 0.0) > 0 ? (surfaceEtaSum[bracket] as double) / (surfaceEtaDistM[bracket] as double) : (pp.eta as double)
-    double revisedEta = (actual > 0 && predicted > 0) ? currentEta * (predicted / actual) : (pp.eta as double)
+    double eta = etaCalibrated[firmnessBracketFor(pp.surface as String)] as double
     double tFactor = pp.tFactor as double
-    double vSeg = suggestedBaseSpeed * slopeFactor / (revisedEta * tFactor)
+    double vSeg = vBaseCalibrated * calibratedSlopeFactor(pp.grade as double) / (eta * tFactor)
     calibratedTotalHours += vSeg > 0 ? segDistKm / vSeg : 0.0
 }
 double calibratedDeltaPct = (recordedModel.totalMovingTimeHours as double) > 0
     ? ((calibratedTotalHours - (recordedModel.totalMovingTimeHours as double)) / (recordedModel.totalMovingTimeHours as double)) * 100.0
     : 0.0
+
 println ''
-println String.format(Locale.ROOT, 'With these adjustments, recalculated moving time is %s (%+.1f%% vs actual, was %+.1f%% before calibration).', formatDuration(calibratedTotalHours), calibratedDeltaPct, movingDeltaPct)
+println '--- Moving time comparison ---'
+println String.format(Locale.ROOT, '%-28s %s', 'Actual moving time:', formatDuration(recordedModel.totalMovingTimeHours as double))
+println String.format(Locale.ROOT, '%-28s %s (%+.1f%%)', 'Raw uncalibrated prediction:', formatDuration(plannedModel.predictedTotalHours as double), movingDeltaPct)
+println String.format(Locale.ROOT, '%-28s %s (%+.1f%%)', 'Hierarchically calibrated:', formatDuration(calibratedTotalHours), calibratedDeltaPct)
 println (Math.abs(calibratedDeltaPct) <= 5.0
     ? 'Within the target +/-5% band.'
     : 'Still outside the target +/-5% band - consider further manual tuning of the brackets above.')
