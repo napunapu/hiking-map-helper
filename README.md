@@ -32,11 +32,14 @@ groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t
 Example:
 
 ```sh
-groovy ElevationProfiler.groovy GR92-etappi16.gpx
+groovy ElevationProfiler.groovy gpx/my-route.gpx
 ```
 
 This prints a summary to the console and writes
-`GR92-etappi16-profile.html` next to the input file.
+`gpx/my-route-profile.html` next to the input file. `gpx/` is a
+suggested, gitignored place to keep your own route files and their
+generated map cache (see below) — they're personal data, not part of the
+tool itself, so nothing under it is tracked or pushed.
 
 ## What it computes
 
@@ -162,10 +165,12 @@ read its `surface`, `sac_scale`, `tracktype` and `highway` tags. This lets
 the tool know, for example, that a descent is on loose gravel rather than
 pavement.
 
-- **Caching**: the raw Overpass response is saved next to the input file as
-  `<gpxBaseName>.osm.json`. On the next run, if that file exists it is
-  loaded directly and the API is not called again — pass `--no-cache` to
-  force a fresh request.
+- **Caching**: the raw Overpass response is saved as
+  `maps/<gpxBaseName>.osm.json` (created next to the input file). On the
+  next run, if that file exists it is loaded directly and the API is not
+  called again — pass `--no-cache` to force a fresh request. The `maps/`
+  folder is gitignored: it's large, regeneratable, third-party-derived
+  cache data, not source data worth tracking or pushing to a remote.
 - **Snapping**: for each GPX point, every candidate way segment within its
   bounding box is checked using a local planar projection (accurate at this
   scale, and far cheaper than repeated great-circle math) to find the

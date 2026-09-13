@@ -6,8 +6,9 @@ Guidance for Claude Code when working in this repository.
 
 This repository holds `ElevationProfiler.groovy`, a standalone CLI tool
 that turns a GPX hiking route into a colour-coded HTML elevation profile
-(see `README.md` for usage), plus the GPX route files it operates on —
-stages of the GR92 long-distance trail.
+(see `README.md` for usage). GPX route files and generated map cache are
+kept locally under `gpx/`, which is gitignored — not tracked in this
+repository.
 
 ## Code style
 

@@ -1337,14 +1337,18 @@ if (points.size() < 2) {
     System.exit(1)
 }
 
-File cacheFile = new File(options.gpxFile.absoluteFile.parentFile, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '.osm.json')
+// Map data is kept out of the GPX file's own directory (and out of git - see .gitignore)
+// since it's large, regeneratable, third-party-derived cache data rather than source data.
+File mapsDir = new File(options.gpxFile.absoluteFile.parentFile, 'maps')
+mapsDir.mkdirs()
+File cacheFile = new File(mapsDir, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '.osm.json')
 Map osmData = null
 String matchSource = 'none'
 
 if (!options.noCache && cacheFile.exists()) {
     osmData = new JsonSlurper().parse(cacheFile) as Map
     matchSource = 'cache'
-    println "Loaded OpenStreetMap data from local cache: ${cacheFile.name}"
+    println "Loaded OpenStreetMap data from local cache: maps/${cacheFile.name}"
 } else {
     try {
         Map bbox = computeBoundingBox(points)
