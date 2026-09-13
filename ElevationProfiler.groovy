@@ -42,8 +42,8 @@ class Options {
     @Option(names = ['--no-cache'], description = 'Force re-querying the Overpass API even if a cached OpenStreetMap response exists')
     boolean noCache = false
 
-    @Option(names = ['-s', '--speed'], description = 'Base flat walking speed in km/h, used for the effort-adjusted duration model (default: 4.0)')
-    double speedKmh = 4.0
+    @Option(names = ['-s', '--speed'], description = 'Base flat walking speed in km/h, used for the effort-adjusted duration model (default: 4.59, calibrated against a recorded GR92 track via RouteCalibrator.groovy)')
+    double speedKmh = 4.59
 
     @Option(names = ['--start-time'], description = 'Planned hike start time, HH:mm 24h (default: 07:00)')
     String startTime = '07:00'
@@ -421,6 +421,22 @@ double terrainFactorForSurface(String surface) {
     1.2
 }
 
+// Speed-model terrain factor: a separate, empirically calibrated surface multiplier used only
+// by the effort-adjusted duration model (see speedSlopeFactor below), not by the trail strain
+// score. RouteCalibrator.groovy measured real hikers' actual pace against a recorded GR92
+// track and found surface roughness costs far less real-world pace than terrainFactorForSurface
+// assumes; that function is left untouched since the strain score's own calibration (a
+// reference 20 km/500 m T1-paved route scored at 50/100) and its "high-strain descent" and
+// mechanical-descent-strain thresholds are tuned against its original 1.0-1.9 scale, not this
+// one. Scree/sand/boulders were not distinctly represented in the one calibration track used so
+// far, so they share the same calibrated value as gravel/rock pending a route that covers them.
+double speedTerrainFactorForSurface(String surface) {
+    String s = (surface ?: '').toLowerCase()
+    Set<String> firm = ['asphalt', 'concrete', 'paved', 'paving_stones', 'compacted', 'fine_gravel', 'hard'] as Set
+
+    firm.contains(s) ? 1.0 : 1.05
+}
+
 // Technical penalty (T-factor): the extra care/exposure/scrambling load implied by the
 // SAC hiking scale, independent of gradient and surface.
 double technicalFactorForSacScale(String sacScale) {
@@ -504,18 +520,38 @@ double din33466Duration(double distanceKm, double ascentM, double descentM) {
     larger + (smaller / 2.0)
 }
 
-// Tobler's hiking function models walking speed (not energy cost) as a function of slope,
-// peaking on a gentle -5% downhill and falling away roughly symmetrically on either side.
-// Unlike a naive inverse-Minetti speed (which would predict speeding up on any downhill,
-// since descending costs less energy up to a point), Tobler's function correctly slows
-// down on steep descents too - matching the real caution/braking a hiker applies on a
-// steep, technical descent regardless of the metabolic saving.
-double toblerSpeedKmh(double gradeFraction) {
-    6.0 * Math.exp(-3.5 * Math.abs(gradeFraction + 0.05))
-}
-
+// Calibrated slope-response curve for the effort-adjusted duration model: a piecewise-linear
+// interpolation between empirically observed anchor points (grade %, speed factor relative to
+// the calibrated flat base speed), replacing Tobler's theoretical hiking function. Tobler
+// predicts an exponential fall-off in both directions from a -5% peak; RouteCalibrator.groovy
+// measured a real hiker's pace against a recorded GR92 track and found actual speed does not
+// fall away nearly that sharply - a moderate descent was even slightly faster than flat pace.
+// Beyond the outermost anchor (steeper than +25.8% or -16.5%), the factor holds flat at that
+// anchor's value rather than extrapolating further, since no calibration data exists past
+// those grades. Anchor grade -> calibrated speed, with v_base = 4.59 km/h: -16.5% -> 4.48 km/h,
+// -7.4% -> 4.88 km/h, 0% -> 4.59 km/h, +7.3% -> 4.35 km/h, +25.8% -> 2.39 km/h.
 double slopeSpeedFactor(double gradeFraction) {
-    toblerSpeedKmh(gradeFraction) / toblerSpeedKmh(0.0)
+    List<List<Double>> anchors = [
+        [-16.5, 4.48 / 4.59], [-7.4, 4.88 / 4.59], [0.0, 1.0], [7.3, 4.35 / 4.59], [25.8, 2.39 / 4.59]
+    ]
+    double gradePct = gradeFraction * 100.0
+    if (gradePct <= anchors[0][0]) {
+        return anchors[0][1]
+    }
+    if (gradePct >= anchors[-1][0]) {
+        return anchors[-1][1]
+    }
+    for (int i = 1; i < anchors.size(); i++) {
+        double g1 = anchors[i][0]
+        if (gradePct <= g1) {
+            double g0 = anchors[i - 1][0]
+            double f0 = anchors[i - 1][1]
+            double f1 = anchors[i][1]
+            double frac = g1 > g0 ? (gradePct - g0) / (g1 - g0) : 0.0
+            return f0 + (f1 - f0) * frac
+        }
+    }
+    anchors[-1][1]
 }
 
 Map durationComparison(double dinDurationHours, double effortDurationHours, double distanceKm, double activeHourlyRate, double baseSpeedKmh) {
@@ -1824,6 +1860,7 @@ for (int i = 0; i < points.size(); i++) {
     points[i].natural = wayInfo.natural
     points[i].landuse = wayInfo.landuse
     points[i].eta = terrainFactorForSurface(wayInfo.surface as String)
+    points[i].speedEta = speedTerrainFactorForSurface(wayInfo.surface as String)
     points[i].tFactor = technicalFactorForSacScale(wayInfo.sacScale as String)
 }
 
@@ -1940,10 +1977,13 @@ for (int i = 1; i < points.size(); i++) {
     points[i].strainFactor = gradeMult * eta * tFactor
     points[i].strainIntensity = eta * tFactor * (gradeMult + brakingIntensitySq)
 
-    // Effort-adjusted duration: integrate a per-segment speed (Tobler's hiking function,
-    // scaled by the same terrain/technical factors) rather than DIN 33466's fixed rates.
+    // Effort-adjusted duration: integrate a per-segment speed (the calibrated slope-response
+    // curve, scaled by the calibrated speed-model terrain factor and the shared technical
+    // factor) rather than DIN 33466's fixed rates. Uses speedEta, not the strain model's eta -
+    // see speedTerrainFactorForSurface's comment for why the two are kept separate.
+    double speedEta = points[i].speedEta as double
     double slopeFactor = slopeSpeedFactor(gradeFraction)
-    double vSegEffort = options.speedKmh * slopeFactor / (eta * tFactor)
+    double vSegEffort = options.speedKmh * slopeFactor / (speedEta * tFactor)
     double segDistKm = segDist / 1000.0
 
     // Dynamic solar exposure and thermal pace degradation: look up the forecast at the

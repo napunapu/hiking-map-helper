@@ -26,7 +26,7 @@ groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t
 | `-o`, `--output` | Output HTML file path | `<input>-profile.html` |
 | `-t`, `--temp` | Fallback ambient temperature in °C, used only if live weather data is unavailable | `20.0` |
 | `-e`, `--exposure` | Forces a *constant* shading factor (`1.0` shaded, `1.1` fully exposed) for both the static hydration model and the dynamic solar model, overriding the dynamic model's per-segment computation. Omit it to let the dynamic model compute exposure per segment | `1.0` |
-| `-s`, `--speed` | Base flat walking speed in km/h, for the effort-adjusted duration model | `4.0` |
+| `-s`, `--speed` | Base flat walking speed in km/h, for the effort-adjusted duration model | `4.59` |
 | `--start-time` | Planned hike start time, `HH:mm` 24h — anchors the weather/solar simulation | `07:00` |
 | `--date` | Planned hike date, `yyyy-MM-dd` — any past date (queries the Archive API) or up to 16 days ahead (Forecast API); further ahead than that disables the weather/solar simulation for that run, falling back to `-t`/`--temp` | today |
 | `--break` | Rest break cadence as `interval:duration` in minutes, e.g. `60:6` for a 6 min pause every 60 min of *moving* time; `0:0` disables breaks | `60:5` |
@@ -79,17 +79,33 @@ moving time very differently:
    reference formula, not a tunable model.
 2. **OSM Terrain & Grade Adjusted** — integrates a walking speed per
    segment: `v_seg = base_speed * slope_factor / (eta * T-factor)`, where
-   `slope_factor` comes from [Tobler's hiking function](https://en.wikipedia.org/wiki/Tobler%27s_hiking_function)
-   (peaking on a gentle -5% downhill, then falling away on both steeper
-   climbs *and* steeper descents). Unlike DIN's fixed 800 m/h descent rate,
-   this explicitly slows down on rough or technical descents rather than
-   assuming descending is always fast — matching real foot-placement
-   braking rather than a pure energy-cost model (which would otherwise
-   predict speeding up on a downhill, since it costs less energy). `eta`
-   and the technical factor are the same per-point values used by the
-   Trail strain model below. `base_speed` defaults to 4.0 km/h and is
-   configurable via `-s`/`--speed`. This speed is then further reduced by
-   a **thermal pace penalty** from the simulated temperature and solar
+   `slope_factor` and `eta` are both **empirically calibrated** against a
+   real recorded GPX track (see "Calibrating the duration model" below),
+   rather than derived purely from theory:
+   - `slope_factor` is a piecewise-linear curve through five measured
+     anchor points (grade → observed speed), replacing
+     [Tobler's hiking function](https://en.wikipedia.org/wiki/Tobler%27s_hiking_function).
+     Tobler predicts an exponential fall-off in both directions from a
+     -5% peak; the calibration track showed real walking speed falling
+     away far less sharply than that — a moderate descent was even
+     slightly *faster* than flat pace. Beyond the outermost anchor
+     (steeper than +25.8% or -16.5%) the factor holds flat rather than
+     extrapolating further, since no calibration data exists past those
+     grades.
+   - `eta` here is a separate, calibrated speed-only terrain factor
+     (`speedTerrainFactorForSurface` in the code) — 1.0 for firm surfaces
+     (paved/compacted), 1.05 for everything else. This is **not** the
+     same `eta` used by the Trail strain model below: that one keeps its
+     original, wider 1.0-1.9 scale, since its own reference-route
+     calibration and thresholds are tuned against it, and recalibrating
+     it against pace data would silently flatten the strain score's
+     terrain sensitivity too.
+
+   Unlike DIN's fixed 800 m/h descent rate, this explicitly varies pace
+   with rough or technical terrain rather than assuming descending is
+   always fast. `base_speed` defaults to 4.59 km/h (also calibrated) and
+   is configurable via `-s`/`--speed`. This speed is then further reduced
+   by a **thermal pace penalty** from the simulated temperature and solar
    radiation at the moment each segment is actually reached — see
    "Dynamic weather & solar exposure" below.
 
@@ -117,6 +133,37 @@ effect; the start time, finish time, break schedule and weather figures in
 that popup reflect the original command-line `-s` value, not the slider.
 See "Interactive sliders" below for how this and the water slider interact
 and persist.
+
+## Calibrating the duration model
+
+`RouteCalibrator.groovy`, a separate standalone script in this repository,
+compares a planned route GPX against a recorded real-world GPX track (e.g.
+an Apple Watch export) and derives calibrated values for `base_speed`,
+`slope_factor` and `eta` via a staged, three-step residual solver:
+
+1. **Baseline flat speed** — the median recorded speed on firm-surface,
+   -3% to +3% grade segments, locked as `v_base`.
+2. **Slope response** — median recorded speed per gradient bracket, on
+   firm terrain only, with a hard descent-speed ceiling (foot placement,
+   not metabolic cost, limits downhill cadence) — locked as a
+   piecewise-linear curve relative to `v_base`.
+3. **Surface friction (eta)** — with `v_base` and the slope curve now
+   fixed, the remaining speed gap on non-firm terrain is solved as a pure
+   residual, clamped to a plausible 1.05-1.60 range.
+
+Each stage is locked against matched, on-route, moving segments only,
+excluding any detected route deviation (a real course change, not a model
+error) and stationary pauses. Run `groovy RouteCalibrator.groovy --help`
+for its options; it reports its own diagnostic breakdown (speed by
+gradient/surface bracket, top overestimation sections, before/after
+verification) rather than writing a profile.
+
+The current defaults in `ElevationProfiler.groovy` (`base_speed` = 4.59
+km/h, the five slope-response anchors, and the calibrated 1.0/1.05 `eta`
+values) come from running this against one recorded GR92 stage and are
+hardcoded, not re-derived at run time — recalibrating against further
+recorded tracks (ideally covering more surface types, since this one
+track had little rough/loose or scree terrain) would refine them further.
 
 ## Difficulty ratings
 
