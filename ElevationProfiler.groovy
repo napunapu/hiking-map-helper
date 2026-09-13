@@ -50,6 +50,9 @@ class Options {
 
     @Option(names = ['--date'], description = 'Planned hike date, yyyy-MM-dd (default: today)')
     String date
+
+    @Option(names = ['--break'], description = 'Rest break cadence as interval:duration in minutes, e.g. "60:6" for a 6-min pause every 60 min of movement; "0:0" disables breaks (default: 60:5)')
+    String breakSpec = '60:5'
 }
 
 double haversine(double lat1, double lon1, double lat2, double lon2) {
@@ -219,13 +222,7 @@ Map computeCentroid(List<Map> points) {
     [lat: lat, lon: lon]
 }
 
-String fetchWeatherRaw(double lat, double lon) {
-    // forecast_days=16 (Open-Meteo's maximum) means one cached response stays valid for
-    // any --date within the next 16 days, not just today, without a date-specific query.
-    String url = "https://api.open-meteo.com/v1/forecast?latitude=${String.format(Locale.ROOT, '%.5f', lat)}" +
-        "&longitude=${String.format(Locale.ROOT, '%.5f', lon)}" +
-        '&hourly=temperature_2m,apparent_temperature,direct_radiation,cloud_cover&timezone=auto&forecast_days=16'
-
+String fetchWeatherResponse(String url) {
     HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
     HttpRequest request = HttpRequest.newBuilder()
         .uri(URI.create(url))
@@ -238,6 +235,26 @@ String fetchWeatherRaw(double lat, double lon) {
         throw new RuntimeException("Open-Meteo request failed with HTTP ${response.statusCode()}: ${response.body()?.take(200)}")
     }
     response.body()
+}
+
+// forecast_days=16 (Open-Meteo's maximum) means one cached response stays valid for any
+// --date within the next 16 days, not just today, without a date-specific query.
+String fetchWeatherForecastRaw(double lat, double lon) {
+    String url = "https://api.open-meteo.com/v1/forecast?latitude=${String.format(Locale.ROOT, '%.5f', lat)}" +
+        "&longitude=${String.format(Locale.ROOT, '%.5f', lon)}" +
+        '&hourly=temperature_2m,direct_radiation,cloud_cover&timezone=auto&forecast_days=16'
+    fetchWeatherResponse(url)
+}
+
+// The Archive API has no rolling forward window like the Forecast API does, so it's
+// queried for the single requested day only - the cache is only valid for that exact
+// date (checked via timelineCoversDate before trusting it).
+String fetchWeatherArchiveRaw(double lat, double lon, LocalDate date) {
+    String url = "https://archive-api.open-meteo.com/v1/archive?latitude=${String.format(Locale.ROOT, '%.5f', lat)}" +
+        "&longitude=${String.format(Locale.ROOT, '%.5f', lon)}" +
+        "&start_date=${date}&end_date=${date}" +
+        '&hourly=temperature_2m,direct_radiation,cloud_cover&timezone=auto'
+    fetchWeatherResponse(url)
 }
 
 Map parseWeatherTimeline(Map weatherData) {
@@ -253,6 +270,17 @@ Map parseWeatherTimeline(Map weatherData) {
         temps: (hourly.temperature_2m as List).collect { (it ?: 0.0) as double },
         radiation: (hourly.direct_radiation as List).collect { (it ?: 0.0) as double }
     ]
+}
+
+// The Archive API's response only covers the single requested day, unlike the Forecast
+// API's rolling 16-day window, so a cached response must be checked against the currently
+// requested date rather than trusted just because a cache file exists.
+boolean timelineCoversDate(Map timeline, LocalDate date) {
+    if (!timeline) {
+        return false
+    }
+    String prefix = date.toString()
+    (timeline.times as List<String>).any { it.startsWith(prefix) }
 }
 
 // Linearly interpolates the hourly Open-Meteo timeline at an arbitrary local timestamp,
@@ -517,9 +545,17 @@ Map durationComparison(double dinDurationHours, double effortDurationHours, doub
     ]
 }
 
-Map dynamicWeatherSummary(LocalDateTime startDateTime, LocalDateTime finishDateTime, double startTemp, double peakTemp, double maxRadiation, double dynamicWaterLitres, double staticCarry, boolean weatherMatched) {
+Map dynamicWeatherSummary(
+    LocalDateTime startDateTime, double dinDurationHours, double terrainDurationHours, double thermalDurationHours,
+    double elapsedHours, double breakDurationHours, int breakCount,
+    double startTemp, double peakTemp, double peakTempNoBreaks, double maxRadiation,
+    double movingWaterLitres, double breakWaterLitres, double staticCarry, boolean weatherMatched
+) {
     DateTimeFormatter clockFmt = DateTimeFormatter.ofPattern('HH:mm')
-    double dynamicCarry = Math.round((dynamicWaterLitres + 0.5) * 10.0) / 10.0
+    LocalDateTime finishDateTime = startDateTime.plusSeconds(Math.round(elapsedHours * 3600.0))
+    double reserveVolume = 0.5
+    double dynamicCarry = Math.round((movingWaterLitres + breakWaterLitres + reserveVolume) * 10.0) / 10.0
+    double tempShift = peakTemp - peakTempNoBreaks
 
     String reason = weatherMatched
         ? String.format(
@@ -527,8 +563,9 @@ Map dynamicWeatherSummary(LocalDateTime startDateTime, LocalDateTime finishDateT
             'Simulated from a %s start using live Open-Meteo hourly forecast data (temperature, direct ' +
             'solar radiation, cloud cover) at this route\'s midpoint location, combined with the matched ' +
             'OpenStreetMap canopy (tunnels, forest, open ridges) to estimate real sun exposure and heat ' +
-            'load per segment, rather than a single flat assumption for the whole hike.',
-            startDateTime.format(clockFmt)
+            'load per segment. %d scheduled break%s (%.0f min total) shift every later segment\'s weather ' +
+            'lookup to the delayed wall clock, rather than a single flat assumption for the whole hike.',
+            startDateTime.format(clockFmt), breakCount, breakCount == 1 ? '' : 's', breakDurationHours * 60.0
           )
         : String.format(
             Locale.ROOT,
@@ -539,8 +576,12 @@ Map dynamicWeatherSummary(LocalDateTime startDateTime, LocalDateTime finishDateT
 
     [
         startTime: startDateTime.format(clockFmt), finishTime: finishDateTime.format(clockFmt),
-        startTemp: startTemp, peakTemp: peakTemp, maxRadiation: maxRadiation,
-        dynamicWaterLitres: dynamicWaterLitres, dynamicCarry: dynamicCarry, staticCarry: staticCarry,
+        dinDurationHours: dinDurationHours, terrainDurationHours: terrainDurationHours,
+        thermalDurationHours: thermalDurationHours, elapsedHours: elapsedHours,
+        breakDurationHours: breakDurationHours, breakCount: breakCount,
+        startTemp: startTemp, peakTemp: peakTemp, peakTempNoBreaks: peakTempNoBreaks, tempShift: tempShift,
+        maxRadiation: maxRadiation, movingWaterLitres: movingWaterLitres, breakWaterLitres: breakWaterLitres,
+        reserveVolume: reserveVolume, dynamicCarry: dynamicCarry, staticCarry: staticCarry,
         weatherMatched: weatherMatched, reason: reason
     ]
 }
@@ -677,6 +718,16 @@ Map trailStrainSummary(double effortDistanceKm, double actualDistanceKm, double 
     ]
 }
 
+Map parseBreakSpec(String spec) {
+    List<String> parts = spec.tokenize(':')
+    if (parts.size() != 2) {
+        throw new IllegalArgumentException("expected 'interval:duration', e.g. '60:5'")
+    }
+    int intervalMin = parts[0].trim() as int
+    int durationMin = parts[1].trim() as int
+    [intervalMin: intervalMin, durationMin: durationMin]
+}
+
 String formatDuration(double hours) {
     int totalMinutes = Math.round(hours * 60.0) as int
     int h = totalMinutes.intdiv(60)
@@ -696,13 +747,25 @@ void printSummary(double distanceKm, double ascent, double descent, double durat
     println String.format(Locale.ROOT, 'DIN hydration need       : %.1f L', durationResult.dinConsumption as double)
     println String.format(Locale.ROOT, 'Effort-adjusted hydration: %.1f L', durationResult.effortConsumption as double)
     println "Weather data     : ${dynamicResult.weatherMatched ? 'Live Open-Meteo forecast' : 'No forecast data; using static -t/--temp value'}"
-    println "Start time       : ${dynamicResult.startTime}"
-    println "Est. finish time : ${dynamicResult.finishTime}"
-    println String.format(Locale.ROOT, 'Start temperature : %.1f degC', dynamicResult.startTemp as double)
-    println String.format(Locale.ROOT, 'Peak temperature  : %.1f degC', dynamicResult.peakTemp as double)
-    println String.format(Locale.ROOT, 'Max solar radiation: %.0f W/m2', dynamicResult.maxRadiation as double)
-    println String.format(Locale.ROOT, 'Dynamic water need : %.1f L (vs flat static estimate %.1f L)', dynamicResult.dynamicCarry as double, dynamicResult.staticCarry as double)
-    println "Reason           : ${dynamicResult.reason}"
+    println "Moving time (DIN 33466)        : ${formatDuration(dynamicResult.dinDurationHours as double)}"
+    println "Moving time (terrain adjusted) : ${formatDuration(dynamicResult.terrainDurationHours as double)}"
+    println "Moving time (thermally adj.)   : ${formatDuration(dynamicResult.thermalDurationHours as double)}"
+    int breakCount = dynamicResult.breakCount as int
+    double breakMinutes = (dynamicResult.breakDurationHours as double) * 60.0
+    println "Total elapsed (incl. breaks)   : ${formatDuration(dynamicResult.elapsedHours as double)} (${breakCount} break${breakCount == 1 ? '' : 's'}, ${Math.round(breakMinutes) as int} min paused)"
+    println "Estimated finish time          : ${dynamicResult.finishTime}"
+    println String.format(Locale.ROOT, 'Start temperature              : %.1f degC', dynamicResult.startTemp as double)
+    double tempShift = dynamicResult.tempShift as double
+    String shiftNote = tempShift > 0.5
+        ? String.format(Locale.ROOT, ' (breaks pushed this %.1f degC hotter than a straight-through hike: %.1f degC)', tempShift, dynamicResult.peakTempNoBreaks as double)
+        : ''
+    println String.format(Locale.ROOT, 'Peak temperature               : %.1f degC%s', dynamicResult.peakTemp as double, shiftNote)
+    println String.format(Locale.ROOT, 'Max solar radiation            : %.0f W/m2', dynamicResult.maxRadiation as double)
+    println String.format(Locale.ROOT, 'Active moving water            : %.1f L', dynamicResult.movingWaterLitres as double)
+    println String.format(Locale.ROOT, 'Break/resting water            : %.1f L', dynamicResult.breakWaterLitres as double)
+    println String.format(Locale.ROOT, 'Safety reserve                 : %.1f L', dynamicResult.reserveVolume as double)
+    println String.format(Locale.ROOT, 'Recommended total carry        : %.1f L (vs flat static estimate %.1f L)', dynamicResult.dynamicCarry as double, dynamicResult.staticCarry as double)
+    println "Reason                         : ${dynamicResult.reason}"
     println "Trail data      : ${trailInfo.matched ? 'Matched to OpenStreetMap (surface/SAC scale available)' : 'Raw GPX (no OSM match; surface/SAC scale unknown)'}"
     println "Difficulty      : ${difficultyResult.tier}"
     println "Reason          : ${difficultyResult.reason}"
@@ -832,7 +895,7 @@ String buildWaterChart(List<Map> chartData, double maxScaleLitres) {
 ${bars}</svg>"""
 }
 
-String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult, Map dynamicResult) {
+String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult, Map dynamicResult, List<Map> breakEvents) {
     String difficulty = difficultyResult.tier
     String difficultyReason = difficultyResult.reason
     double maxGrade = difficultyResult.maxGrade as double
@@ -878,9 +941,16 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     String dynamicFinishTime = dynamicResult.finishTime
     double dynamicStartTemp = dynamicResult.startTemp as double
     double dynamicPeakTemp = dynamicResult.peakTemp as double
+    double dynamicPeakTempNoBreaks = dynamicResult.peakTempNoBreaks as double
     double dynamicMaxRadiation = dynamicResult.maxRadiation as double
     double dynamicCarry = dynamicResult.dynamicCarry as double
     double dynamicStaticCarry = dynamicResult.staticCarry as double
+    double dynamicMovingWaterLitres = dynamicResult.movingWaterLitres as double
+    double dynamicBreakWaterLitres = dynamicResult.breakWaterLitres as double
+    double dynamicReserveVolume = dynamicResult.reserveVolume as double
+    double dynamicElapsedHours = dynamicResult.elapsedHours as double
+    double dynamicBreakDurationHours = dynamicResult.breakDurationHours as double
+    int dynamicBreakCount = dynamicResult.breakCount as int
     String dynamicReason = dynamicResult.reason
     int width = 1100
     int height = 420
@@ -942,6 +1012,22 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             clockTime, ambientTemp, radiation, segExposure, sunLabel, thermalPenaltyPct
         )
         hitAreas << "<rect x=\"${fmt(Math.min(x0, x1))}\" y=\"${padding}\" width=\"${fmt(Math.max(1.0d, Math.abs(x1 - x0)))}\" height=\"${plotHeight}\" fill=\"transparent\" data-tip=\"${escapeXml(tooltip)}\" data-x=\"${fmt(x1)}\" onmousemove=\"showTip(event)\" onmouseleave=\"hideTip()\" />\n"
+    }
+
+    // Scheduled rest breaks: a dashed vertical marker plus a small flag, with its own thin
+    // hit-rect reusing the same tooltip/crosshair machinery as the main profile.
+    StringBuilder breakMarkers = new StringBuilder()
+    breakEvents.each { brk ->
+        double bx = xFor((brk.distanceKm as double) * 1000.0)
+        double topY = padding
+        double botY = padding + plotHeight
+        String breakTip = String.format(
+            Locale.ROOT, 'Break at %s (%d min) | %.1f km',
+            brk.clockTime as String, brk.durationMin as int, brk.distanceKm as double
+        )
+        breakMarkers << "<line x1=\"${fmt(bx)}\" y1=\"${topY}\" x2=\"${fmt(bx)}\" y2=\"${botY}\" stroke=\"#8E24AA\" stroke-width=\"1.5\" stroke-dasharray=\"3,2\" />\n"
+        breakMarkers << "<circle cx=\"${fmt(bx)}\" cy=\"${topY - 6}\" r=\"5\" fill=\"#8E24AA\" />\n"
+        breakMarkers << "<rect x=\"${fmt(bx - 6)}\" y=\"${topY - 14}\" width=\"12\" height=\"${plotHeight + 14}\" fill=\"transparent\" data-tip=\"${escapeXml(breakTip)}\" data-x=\"${fmt(bx)}\" onmousemove=\"showTip(event)\" onmouseleave=\"hideTip()\" />\n"
     }
 
     StringBuilder grid = new StringBuilder()
@@ -1118,6 +1204,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         <div><span>Descent</span><strong>${String.format(Locale.ROOT, '%.0f m', descent)}</strong></div>
         <div><span>Duration (DIN 33466)</span><strong>${formatDuration(durationDinHours)} (${String.format(Locale.ROOT, '%.1f km/h', durationDinPaceKmh)})</strong></div>
         <div><span>Duration (terrain adjusted)</span><strong class="clickable" onclick="showDurationInfo()"><span id="duration-tile-value">${formatDuration(durationEffortHours)} (${String.format(Locale.ROOT, '%.1f km/h', durationEffortPaceKmh)})</span> &#9432;</strong></div>
+        <div><span>Elapsed (door-to-door)</span><strong class="clickable" onclick="showDurationInfo()">${formatDuration(dynamicElapsedHours)} &#9432;</strong></div>
         <div><span>Difficulty</span><strong class="clickable" onclick="showDifficultyInfo()">${difficulty} &#9432;</strong></div>
         <div><span>Effort (Shenandoah)</span><strong class="clickable" onclick="showEffortInfo()">${effortTier} &#9432;</strong></div>
         <div><span>Water (at <span id="water-tile-temp">${Math.round(waterTempCelsius) as int}</span>&deg;C)</span><strong class="clickable" onclick="showWaterInfo()"><span id="water-tile-value">${String.format(Locale.ROOT, '%.1f L', waterRecommendedCarry)}</span> &#9432;</strong></div>
@@ -1144,6 +1231,9 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
                 ${solarBand}
             </g>
             ${hitAreas}
+            <g id="break-markers">
+                ${breakMarkers}
+            </g>
             <line id="crosshair" x1="0" y1="${padding}" x2="0" y2="${padding + plotHeight}" />
         </svg>
         <div id="tooltip"></div>
@@ -1151,6 +1241,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     <p class="trail-data-note">Solar intensity band along the top of the chart: dark = shade/twilight, amber = partial sun, orange = full sun.</p>
     <p class="trail-data-note">${trailMatched ? 'Trail data: matched to OpenStreetMap (surface/SAC scale available).' : 'Trail data: no OpenStreetMap match (surface/SAC scale unknown).'}</p>
     <p class="trail-data-note">${dynamicResult.weatherMatched ? 'Weather data: live Open-Meteo forecast.' : 'Weather data: no forecast available (flat static temperature assumed).'}</p>
+    <p class="trail-data-note">${breakEvents.isEmpty() ? 'No scheduled rest breaks for this run (see --break).' : "Dashed purple markers show ${breakEvents.size()} scheduled rest break(s) - hover for time and duration."}</p>
     <div id="difficulty-modal" class="modal-overlay" onclick="hideDifficultyInfo()">
         <div class="modal-box" onclick="event.stopPropagation()">
             <h2>Why "${difficulty}"?</h2>
@@ -1281,10 +1372,15 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             <table>
                 <tr><th colspan="2">Simulated weather &amp; solar exposure</th></tr>
                 <tr><td>Start time</td><td>${dynamicStartTime}</td></tr>
-                <tr><td>Estimated finish time</td><td>${dynamicFinishTime}</td></tr>
-                <tr><td>Start / peak temperature</td><td>${String.format(Locale.ROOT, '%.1f / %.1f degC', dynamicStartTemp, dynamicPeakTemp)}</td></tr>
+                <tr><td>Estimated finish time (door-to-door)</td><td>${dynamicFinishTime}</td></tr>
+                <tr><td>Elapsed, incl. breaks</td><td>${formatDuration(dynamicElapsedHours)} (${dynamicBreakCount} break${dynamicBreakCount == 1 ? '' : 's'}, ${Math.round(dynamicBreakDurationHours * 60.0) as int} min paused)</td></tr>
+                <tr><td>Start / peak temperature</td><td>${String.format(Locale.ROOT, '%.1f / %.1f degC', dynamicStartTemp, dynamicPeakTemp)}${dynamicPeakTemp - dynamicPeakTempNoBreaks > 0.5 ? String.format(Locale.ROOT, ' (%.1f degC hotter than without breaks)', dynamicPeakTemp - dynamicPeakTempNoBreaks) : ''}</td></tr>
                 <tr><td>Max solar radiation</td><td>${String.format(Locale.ROOT, '%.0f W/m2', dynamicMaxRadiation)}</td></tr>
-                <tr><td>Dynamic water need (vs flat static)</td><td>${String.format(Locale.ROOT, '%.1f L (vs %.1f L)', dynamicCarry, dynamicStaticCarry)}</td></tr>
+                <tr><th colspan="2">Hydration breakdown</th></tr>
+                <tr><td>Active moving</td><td>${String.format(Locale.ROOT, '%.1f L', dynamicMovingWaterLitres)}</td></tr>
+                <tr><td>Break / resting</td><td>${String.format(Locale.ROOT, '%.1f L', dynamicBreakWaterLitres)}</td></tr>
+                <tr><td>Safety reserve</td><td>${String.format(Locale.ROOT, '%.1f L', dynamicReserveVolume)}</td></tr>
+                <tr><td><strong>Recommended total carry</strong></td><td><strong>${String.format(Locale.ROOT, '%.1f L', dynamicCarry)}</strong> (vs ${String.format(Locale.ROOT, '%.1f L', dynamicStaticCarry)} flat static)</td></tr>
             </table>
             <p style="font-size: 12px; color: #666;">${escapeXml(dynamicReason)}</p>
             <p style="font-size: 11px; color: #999;">
@@ -1604,16 +1700,28 @@ if (options.date) {
     }
 }
 
-// Open-Meteo's forecast endpoint has no historical data and only extends 16 days ahead
-// (see fetchWeatherRaw), so dates outside that window can't be simulated meaningfully.
-boolean dateWithinForecastRange = !startLocalDate.isBefore(today) && !startLocalDate.isAfter(today.plusDays(16))
-if (startLocalDate.isBefore(today)) {
-    System.err.println("--date ${startLocalDate} is in the past; Open-Meteo has no historical forecast data, so weather simulation is disabled for this run (using static -t/--temp instead).")
-} else if (startLocalDate.isAfter(today.plusDays(16))) {
+// Past dates are served by the Archive API and future dates by the Forecast API (which
+// only extends 16 days ahead) - only dates further out than that can't be simulated.
+boolean isPastDate = startLocalDate.isBefore(today)
+boolean dateSupported = isPastDate || !startLocalDate.isAfter(today.plusDays(16))
+if (!dateSupported) {
     System.err.println("--date ${startLocalDate} is more than 16 days ahead; Open-Meteo's forecast doesn't reach that far, so weather simulation is disabled for this run (using static -t/--temp instead).")
 }
 
 LocalDateTime startDateTime = LocalDateTime.of(startLocalDate, startLocalTime)
+
+Map breakSpec
+try {
+    breakSpec = parseBreakSpec(options.breakSpec)
+} catch (Exception ex) {
+    System.err.println("Invalid --break '${options.breakSpec}' (${ex.message}); using 60:5.")
+    breakSpec = [intervalMin: 60, durationMin: 5]
+}
+int breakIntervalMin = breakSpec.intervalMin as int
+int breakDurationMin = breakSpec.durationMin as int
+boolean breaksEnabled = breakIntervalMin > 0 && breakDurationMin > 0
+double breakIntervalHours = breakIntervalMin / 60.0
+double breakDurationHoursEach = breakDurationMin / 60.0
 
 List<Map> points = parseGpx(options.gpxFile)
 if (points.size() < 2) {
@@ -1650,24 +1758,42 @@ List<Map> osmWays = parseOsmWays(osmData)
 Map trailInfo = [matched: !osmWays.isEmpty(), source: matchSource]
 double surfaceSnapThresholdM = 30.0
 
-File weatherCacheFile = new File(mapsDir, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '.weather.json')
+String weatherCacheBaseName = options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '')
+// Historic (Archive API) dates each get their own permanent cache file, since every
+// distinct past date is a genuinely different, independently reusable dataset - unlike
+// the Forecast API's single rolling window, which stays valid for any nearby date and so
+// only needs one shared file. Without this, querying a second past date would overwrite
+// the first date's cache, forcing a re-fetch if you ever went back to it.
+File weatherCacheFile = isPastDate
+    ? new File(mapsDir, "${weatherCacheBaseName}.weather.${startLocalDate}.json")
+    : new File(mapsDir, "${weatherCacheBaseName}.weather.json")
 Map weatherData = null
 
-if (!dateWithinForecastRange) {
+if (!dateSupported) {
     // Already warned above; no point querying (or trusting a stale cache against) a date
-    // Open-Meteo's forecast endpoint can't actually cover.
-} else if (!options.noCache && weatherCacheFile.exists()) {
-    weatherData = new JsonSlurper().parse(weatherCacheFile) as Map
-    println "Loaded weather data from local cache: maps/${weatherCacheFile.name}"
+    // Open-Meteo can't actually cover.
 } else {
-    try {
-        Map centroid = computeCentroid(points)
-        String rawJson = fetchWeatherRaw(centroid.lat as double, centroid.lon as double)
-        weatherCacheFile.text = rawJson
-        weatherData = new JsonSlurper().parseText(rawJson) as Map
-        println 'Fetched and cached weather data from Open-Meteo'
-    } catch (Exception ex) {
-        System.err.println("Open-Meteo request failed (${ex.message}); using static -t/--temp value with no solar radiation model.")
+    Map cachedData = (!options.noCache && weatherCacheFile.exists()) ? new JsonSlurper().parse(weatherCacheFile) as Map : null
+    Map cachedTimeline = cachedData ? parseWeatherTimeline(cachedData) : null
+
+    // Belt-and-braces: the per-date filename already keeps historic caches from colliding,
+    // and the Forecast API's cache is a rolling 16-day window valid for any nearby --date,
+    // but only trust either cache if it actually covers the currently requested date.
+    if (cachedTimeline && timelineCoversDate(cachedTimeline, startLocalDate)) {
+        weatherData = cachedData
+        println "Loaded weather data from local cache: maps/${weatherCacheFile.name}"
+    } else {
+        try {
+            Map centroid = computeCentroid(points)
+            String rawJson = isPastDate
+                ? fetchWeatherArchiveRaw(centroid.lat as double, centroid.lon as double, startLocalDate)
+                : fetchWeatherForecastRaw(centroid.lat as double, centroid.lon as double)
+            weatherCacheFile.text = rawJson
+            weatherData = new JsonSlurper().parseText(rawJson) as Map
+            println "Fetched and cached weather data from Open-Meteo (${isPastDate ? 'Archive' : 'Forecast'} API)"
+        } catch (Exception ex) {
+            System.err.println("Open-Meteo request failed (${ex.message}); using static -t/--temp value with no solar radiation model.")
+        }
     }
 }
 
@@ -1715,11 +1841,18 @@ double roughSteepDescentDistanceM = 0.0
 double totalMetabolicCostM = 0.0
 double totalBrakingIndex = 0.0
 double highStrainDescentDistanceM = 0.0
+double totalTerrainDurationHours = 0.0
 double totalEffortDurationHours = 0.0
 double totalDynamicWaterLitres = 0.0
-double simulatedElapsedHours = 0.0
+double totalBreakDurationHours = 0.0
+double totalBreakWaterLitres = 0.0
+double movingTimeSinceLastBreakHours = 0.0
+int breakCount = 0
+List<Map> breakEvents = []
+double wallClockElapsedHours = 0.0
 double startTempEncountered = options.tempCelsius
 double peakTempEncountered = options.tempCelsius
+double peakTempWithoutBreaksEncountered = options.tempCelsius
 double maxRadiationEncountered = 0.0
 Map<String, Double> surfaceDistanceM = [:].withDefault { 0.0 }
 points[0].grade = 0.0
@@ -1738,6 +1871,7 @@ if (weatherMatched) {
     if (startWeather) {
         startTempEncountered = startWeather.temp as double
         peakTempEncountered = startTempEncountered
+        peakTempWithoutBreaksEncountered = startTempEncountered
     }
 }
 for (int i = 1; i < points.size(); i++) {
@@ -1810,14 +1944,22 @@ for (int i = 1; i < points.size(); i++) {
     // scaled by the same terrain/technical factors) rather than DIN 33466's fixed rates.
     double slopeFactor = slopeSpeedFactor(gradeFraction)
     double vSegEffort = options.speedKmh * slopeFactor / (eta * tFactor)
+    double segDistKm = segDist / 1000.0
 
     // Dynamic solar exposure and thermal pace degradation: look up the forecast at the
-    // clock time this segment is actually reached (i.e. simulated, pace-dependent), not a
-    // single flat assumption for the whole hike.
-    LocalDateTime segClock = startDateTime.plusSeconds(Math.round(simulatedElapsedHours * 3600.0))
+    // break-delayed wall clock this segment is actually reached at (i.e. simulated,
+    // pace- and break-dependent), not a single flat assumption for the whole hike.
+    LocalDateTime segClock = startDateTime.plusSeconds(Math.round(wallClockElapsedHours * 3600.0))
     Map segWeather = weatherMatched ? weatherAtTime(weatherTimeline, segClock) : null
     double segTemp = segWeather ? segWeather.temp as double : options.tempCelsius
     double segRadiation = segWeather ? segWeather.radiation as double : 0.0
+
+    // Shadow clock ignoring break delays, purely to report how much the scheduled breaks
+    // shifted the peak temperature encountered - no other effect on the simulation.
+    LocalDateTime noBreakClock = startDateTime.plusSeconds(Math.round(totalEffortDurationHours * 3600.0))
+    Map noBreakWeather = weatherMatched ? weatherAtTime(weatherTimeline, noBreakClock) : null
+    double noBreakTemp = noBreakWeather ? noBreakWeather.temp as double : options.tempCelsius
+    peakTempWithoutBreaksEncountered = Math.max(peakTempWithoutBreaksEncountered, noBreakTemp)
 
     peakTempEncountered = Math.max(peakTempEncountered, segTemp)
     maxRadiationEncountered = Math.max(maxRadiationEncountered, segRadiation)
@@ -1830,11 +1972,12 @@ for (int i = 1; i < points.size(); i++) {
     double effectiveHeat = segTemp + (segRadiation / 1000.0) * 2.0
     double thermalFactor = Math.max(0.65, 1.0 - Math.max(0.0, effectiveHeat - 15.0) * 0.008)
     double vSegThermal = vSegEffort * thermalFactor
-    double segDistKm = segDist / 1000.0
     double tSegHours = segDistKm / vSegThermal
 
+    totalTerrainDurationHours += segDistKm / vSegEffort
     totalEffortDurationHours += tSegHours
-    simulatedElapsedHours += tSegHours
+    wallClockElapsedHours += tSegHours
+    movingTimeSinceLastBreakHours += tSegHours
 
     double segHourlyRate = (0.35 + Math.max(0.0, segTemp - 15.0) * 0.02) * segExposure
     totalDynamicWaterLitres += tSegHours * segHourlyRate
@@ -1845,6 +1988,31 @@ for (int i = 1; i < points.size(); i++) {
     points[i].exposureFactor = segExposure
     points[i].thermalPenaltyPct = (1.0 - thermalFactor) * 100.0
     points[i].sunLabel = sunLabelFor(canopyClass, segRadiation)
+
+    // Scheduled resting breaks: triggered by pure moving time (not wall clock), so the
+    // cadence is "every N minutes of walking" and doesn't drift from counting break time
+    // towards itself. A while loop handles the rare case of a single long segment crossing
+    // more than one break threshold.
+    while (breaksEnabled && movingTimeSinceLastBreakHours >= breakIntervalHours) {
+        LocalDateTime breakClock = startDateTime.plusSeconds(Math.round(wallClockElapsedHours * 3600.0))
+        Map breakWeather = weatherMatched ? weatherAtTime(weatherTimeline, breakClock) : null
+        double breakTemp = breakWeather ? breakWeather.temp as double : options.tempCelsius
+
+        double restingHourlyRate = (0.15 + Math.max(0.0, breakTemp - 15.0) * 0.015) * segExposure
+        double pauseWaterLitres = breakDurationHoursEach * restingHourlyRate
+        totalBreakWaterLitres += pauseWaterLitres
+
+        breakEvents << [
+            distanceKm: (points[i].distance as double) / 1000.0,
+            clockTime: breakClock.format(DateTimeFormatter.ofPattern('HH:mm')),
+            durationMin: breakDurationMin
+        ]
+
+        wallClockElapsedHours += breakDurationHoursEach
+        totalBreakDurationHours += breakDurationHoursEach
+        movingTimeSinceLastBreakHours -= breakIntervalHours
+        breakCount++
+    }
 }
 
 Map descentStrain = [
@@ -1860,11 +2028,15 @@ Map shenandoahResult = shenandoahDifficulty(totalAscent, totalDistanceKm)
 Map waterResult = waterIntakeRecommendation(durationHours, options.tempCelsius, options.exposureFactor)
 Map trailStrain = trailStrainSummary(totalMetabolicCostM / 1000.0, totalDistanceKm, totalBrakingIndex, highStrainDescentDistanceM / 1000.0, surfaceDistanceM, cumulative)
 Map durationResult = durationComparison(durationHours, totalEffortDurationHours, totalDistanceKm, waterResult.activeHourlyRate as double, options.speedKmh)
-LocalDateTime finishDateTime = startDateTime.plusSeconds(Math.round(totalEffortDurationHours * 3600.0))
-Map dynamicResult = dynamicWeatherSummary(startDateTime, finishDateTime, startTempEncountered, peakTempEncountered, maxRadiationEncountered, totalDynamicWaterLitres, waterResult.recommendedCarry as double, weatherMatched)
+Map dynamicResult = dynamicWeatherSummary(
+    startDateTime, durationHours, totalTerrainDurationHours, totalEffortDurationHours,
+    wallClockElapsedHours, totalBreakDurationHours, breakCount,
+    startTempEncountered, peakTempEncountered, peakTempWithoutBreaksEncountered, maxRadiationEncountered,
+    totalDynamicWaterLitres, totalBreakWaterLitres, waterResult.recommendedCarry as double, weatherMatched
+)
 
 printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult)
 
 File output = options.outputPath ? new File(options.outputPath) : new File(options.gpxFile.absoluteFile.parentFile, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '-profile.html')
-output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult)
+output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult, breakEvents)
 println "Elevation profile written to: ${output.absolutePath}"

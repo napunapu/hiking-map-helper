@@ -17,7 +17,7 @@ pace and hydration.
 ## Usage
 
 ```sh
-groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>] [-s <speed>] [--start-time <HH:mm>] [--date <yyyy-MM-dd>] [--no-cache]
+groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>] [-s <speed>] [--start-time <HH:mm>] [--date <yyyy-MM-dd>] [--break <interval:duration>] [--no-cache]
 ```
 
 | Option | Description | Default |
@@ -28,17 +28,19 @@ groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t
 | `-e`, `--exposure` | Forces a *constant* shading factor (`1.0` shaded, `1.1` fully exposed) for both the static hydration model and the dynamic solar model, overriding the dynamic model's per-segment computation. Omit it to let the dynamic model compute exposure per segment | `1.0` |
 | `-s`, `--speed` | Base flat walking speed in km/h, for the effort-adjusted duration model | `4.0` |
 | `--start-time` | Planned hike start time, `HH:mm` 24h — anchors the weather/solar simulation | `07:00` |
-| `--date` | Planned hike date, `yyyy-MM-dd` — must be today or within the next 16 days (Open-Meteo's forecast range); past dates or dates further out disable the weather/solar simulation for that run, falling back to `-t`/`--temp` | today |
+| `--date` | Planned hike date, `yyyy-MM-dd` — any past date (queries the Archive API) or up to 16 days ahead (Forecast API); further ahead than that disables the weather/solar simulation for that run, falling back to `-t`/`--temp` | today |
+| `--break` | Rest break cadence as `interval:duration` in minutes, e.g. `60:6` for a 6 min pause every 60 min of *moving* time; `0:0` disables breaks | `60:5` |
 | `--no-cache` | Force re-querying the Overpass and Open-Meteo APIs even if cached responses exist | `false` |
 | `-h`, `--help` | Show usage and exit | |
 | `-V`, `--version` | Show version and exit | |
 
-Neither `-s`/`--speed` nor `--start-time`/`--date` change what's requested
-from Overpass or Open-Meteo — those queries are parameterised only by the
-route's location (bounding box / centroid), not by time. `--start-time`
-and `--date` instead pick where in the *already-fetched* hourly forecast
-the simulated clock begins, and `-s` affects how fast that simulated clock
-advances through it.
+Neither `-s`/`--speed` nor `--start-time` change what's requested from
+Overpass or Open-Meteo — those affect only where in the *already-fetched*
+hourly weather the simulated clock begins (`--start-time`) and how fast it
+advances through it (`-s`). `--date` is the exception: whether it's today
+or in the future versus in the past decides which Open-Meteo endpoint
+(Forecast or Archive) actually gets queried — see "Dynamic weather & solar
+exposure" below.
 
 Example:
 
@@ -96,6 +98,14 @@ Zone 2 burn rate, plus the 0.5 L reserve), and the console/HTML both show
 the difference between the two duration estimates. This is separate from
 the fully dynamic, per-segment water total described below.
 
+The console additionally breaks the "OSM Terrain & Grade Adjusted" figure
+into two: *moving time (terrain adjusted)* is terrain/grade alone, with no
+thermal penalty; *moving time (thermally adjusted)* adds the weather-driven
+slowdown on top — the latter is what the HTML tile and popup show, since
+it's the more complete estimate. A third figure, **total elapsed
+(door-to-door)**, adds scheduled rest breaks on top of that — see
+"Scheduled rest breaks" below — and gets its own summary tile.
+
 In the HTML, the "OSM Terrain & Grade Adjusted" tile's popup has a base
 speed slider. Since terrain/grade alone scale duration exactly
 proportionally to speed, the browser rescales the server-computed duration
@@ -103,10 +113,10 @@ rather than re-integrating every segment — but this is now an
 **approximation**, since the thermal penalty technically depends on *when*
 (clock time) a faster or slower pace reaches each segment. In practice the
 weather changes slowly enough over a same-day hike that this is a small
-effect; the start time, finish time and weather figures in that popup
-reflect the original command-line `-s` value, not the slider. See
-"Interactive sliders" below for how this and the water slider interact and
-persist.
+effect; the start time, finish time, break schedule and weather figures in
+that popup reflect the original command-line `-s` value, not the slider.
+See "Interactive sliders" below for how this and the water slider interact
+and persist.
 
 ## Difficulty ratings
 
@@ -206,26 +216,38 @@ pavement.
 
 ## Dynamic weather & solar exposure
 
-The tool fetches an hourly forecast (temperature, direct solar radiation,
-cloud cover) from the free [Open-Meteo API](https://open-meteo.com/) — no
-key required — for this route's centroid, covering today plus the next
-16 days in one request, and simulates walking through it minute by minute
-from `--date`/`--start-time` (default: today, 07:00), rather than assuming
-one flat temperature for the whole hike.
+The tool fetches an hourly weather timeline (temperature, direct solar
+radiation, cloud cover) from the free [Open-Meteo](https://open-meteo.com/)
+Forecast or Archive API — no key required — for this route's centroid, and
+simulates walking through it minute by minute from `--date`/`--start-time`
+(default: today, 07:00), rather than assuming one flat temperature for the
+whole hike.
 
-- **Caching**: the raw response is saved as `maps/<gpxBaseName>.weather.json`,
-  loaded on the next run unless `--no-cache` is passed. Since one response
-  already covers 16 days, the same cache serves any `--date` in that
-  range — but it's still a snapshot from whenever it was fetched, so if
-  you're planning several days out, re-fetch closer to the day
-  (`--no-cache`) for a more accurate forecast. If the request fails and no
-  cache exists, the tool falls back to a flat `-t`/`--temp` value with no
-  solar radiation model, and says so.
-- **Date range**: `--date` must be today or within the next 16 days — past
-  dates aren't supported (Open-Meteo's forecast endpoint has no historical
-  data) and dates further out aren't forecast yet. Either case disables
-  the weather/solar simulation for that run with a clear warning, falling
-  back to `-t`/`--temp`.
+- **Forecast vs Archive**: `--date` today or in the future queries the
+  [Forecast API](https://open-meteo.com/en/docs), covering today plus the
+  next 16 days in one request; `--date` in the past queries the
+  [Archive API](https://open-meteo.com/en/docs/historical-weather-api)
+  instead, for that single day. Both return the same `hourly.time` /
+  `temperature_2m` / `direct_radiation` / `cloud_cover` shape, so the rest
+  of the simulation doesn't need to know which one answered.
+- **Caching**: the Forecast API's response is saved as
+  `maps/<gpxBaseName>.weather.json` — one shared file, since its 16-day
+  window covers any nearby `--date` without refetching. Each Archive
+  (historic) date instead gets its own permanent file,
+  `maps/<gpxBaseName>.weather.<yyyy-MM-dd>.json`, since every past date is
+  an independent dataset — fetching one historic date doesn't evict
+  another you looked up earlier; each stays cached and is reused if you
+  come back to it. Either way, a cache is only trusted if it actually
+  covers the currently requested `--date`, and `--no-cache` forces a fresh
+  request regardless. A forecast is still just a snapshot from whenever it
+  was fetched — for a forecast several days out, re-fetch closer to the
+  day (`--no-cache`) for accuracy. If the request fails and no cache
+  exists, the tool falls back to a flat `-t`/`--temp` value with no solar
+  radiation model, and says so.
+- **Date range**: `--date` can be any past date or up to 16 days in the
+  future. Dates further in the future than that aren't forecast yet, which
+  disables the weather/solar simulation for that run with a clear warning,
+  falling back to `-t`/`--temp`.
 - **Simulated clock**: each segment's *actual* time-of-day depends on how
   long the hike has taken so far, which depends on speed, terrain and the
   weather already encountered — so a slow, technical section pushes later
@@ -253,7 +275,34 @@ one flat temperature for the whole hike.
 - **Dynamic hydration**: each segment's water need scales with its own
   local temperature and exposure factor, then sums across the whole route
   (plus a fixed 0.5 L reserve) — shown alongside the flat static estimate
-  in the console output and the Duration popup.
+  in the console output and the Duration popup. This active-moving total is
+  reported separately from break/resting consumption — see below.
+
+## Scheduled rest breaks
+
+By default (`--break 60:5`), the simulation inserts a 5-minute rest every
+60 minutes of *moving* time — pass `--break 0:0` to disable, or e.g.
+`--break 45:10` for a 10-minute break every 45 minutes.
+
+- **Dual clock**: moving time (pure locomotion) and elapsed/wall-clock time
+  (moving *plus* pauses) are tracked separately. Breaks are triggered by
+  moving time — a slower pace doesn't make breaks more frequent in
+  distance/time terms, it just means more of the route is covered before
+  each one.
+- **Weather shift**: every break advances the wall clock (but not moving
+  time) by the break duration, and every subsequent segment's weather
+  lookup uses that delayed wall clock — so enough breaks can genuinely
+  walk you into a hotter part of the day than a straight-through hike
+  would reach. The console/HTML note the shift in peak temperature this
+  causes, if any (some routes already reach the day's peak regardless of
+  breaks, in which case there's nothing left to shift).
+- **Resting hydration**: `resting_hourly_rate = (0.15 + max(0, temp - 15) *
+  0.015) * effective_exposure` — lower than the moving rate, since you're
+  not exerting, but still scales with heat and sun exposure at the pause
+  location. Reported separately from active-moving consumption, and
+  included in the recommended total carry.
+- **Visualised** as dashed purple vertical markers along the elevation
+  profile (hover for the break's time, duration and distance marker).
 
 ## Mechanical descent strain
 
@@ -319,12 +368,15 @@ The HTML file contains a self-contained, responsive SVG elevation profile:
   (shade/twilight), amber (partial sun) or orange (full sun), giving an
   at-a-glance sense of where along the route — and at what simulated
   time of day — the sun exposure is highest.
+- Dashed purple vertical markers show each scheduled rest break (hover for
+  its time, duration and distance).
 - Hovering over the profile shows a crosshair at that point, plus a tooltip
   with distance, elevation, instantaneous gradient, surface type, SAC trail
   scale, the local terrain multiplier (eta), the relative strain factor
-  (e.g. "1.4x flat equivalent"), the simulated clock time, ambient
-  temperature, direct solar radiation, the dynamic exposure multiplier
-  (e.g. "1.18x (Full sun)") and the resulting thermal pace penalty.
+  (e.g. "1.4x flat equivalent"), the simulated (break-delayed) clock time,
+  ambient temperature, direct solar radiation, the dynamic exposure
+  multiplier (e.g. "1.18x (Full sun)") and the resulting thermal pace
+  penalty.
 - No external assets are loaded; the file can be opened directly in a
   browser or shared as-is.
 
