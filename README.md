@@ -2,32 +2,43 @@
 
 A standalone Groovy script that turns a GPX hiking route into a colour-coded
 elevation profile, with distance, ascent/descent, two independent difficulty
-ratings, a hydration recommendation and trail surface data pulled from
-OpenStreetMap.
+ratings, a hydration recommendation, trail surface data pulled from
+OpenStreetMap, and a simulated weather/solar-exposure model driving both
+pace and hydration.
 
 ## Requirements
 
 - [Groovy](https://groovy-lang.org/) on your `PATH`.
 - Internet access on first run, so `@Grab` can download
   [picocli](https://picocli.info/) (cached afterwards), and to query the
-  Overpass API for trail surface data (no API key needed; see below).
+  Overpass API (trail surface) and Open-Meteo API (weather/solar) — neither
+  needs an API key; see below.
 
 ## Usage
 
 ```sh
-groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>] [-s <speed>] [--no-cache]
+groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>] [-s <speed>] [--start-time <HH:mm>] [--date <yyyy-MM-dd>] [--no-cache]
 ```
 
 | Option | Description | Default |
 | --- | --- | --- |
 | `-w`, `--window` | Moving-average smoothing window, in points | `5` |
 | `-o`, `--output` | Output HTML file path | `<input>-profile.html` |
-| `-t`, `--temp` | Forecast max ambient temperature in shade, in °C | `20.0` |
-| `-e`, `--exposure` | Route shading factor: `1.0` forest/partial shade, `1.1` fully exposed ridges | `1.0` |
+| `-t`, `--temp` | Fallback ambient temperature in °C, used only if live weather data is unavailable | `20.0` |
+| `-e`, `--exposure` | Forces a *constant* shading factor (`1.0` shaded, `1.1` fully exposed) for both the static hydration model and the dynamic solar model, overriding the dynamic model's per-segment computation. Omit it to let the dynamic model compute exposure per segment | `1.0` |
 | `-s`, `--speed` | Base flat walking speed in km/h, for the effort-adjusted duration model | `4.0` |
-| `--no-cache` | Force re-querying the Overpass API even if a cached response exists | `false` |
+| `--start-time` | Planned hike start time, `HH:mm` 24h — anchors the weather/solar simulation | `07:00` |
+| `--date` | Planned hike date, `yyyy-MM-dd` — must be today or within the next 16 days (Open-Meteo's forecast range); past dates or dates further out disable the weather/solar simulation for that run, falling back to `-t`/`--temp` | today |
+| `--no-cache` | Force re-querying the Overpass and Open-Meteo APIs even if cached responses exist | `false` |
 | `-h`, `--help` | Show usage and exit | |
 | `-V`, `--version` | Show version and exit | |
+
+Neither `-s`/`--speed` nor `--start-time`/`--date` change what's requested
+from Overpass or Open-Meteo — those queries are parameterised only by the
+route's location (bounding box / centroid), not by time. `--start-time`
+and `--date` instead pick where in the *already-fetched* hourly forecast
+the simulated clock begins, and `-s` affects how fast that simulated clock
+advances through it.
 
 Example:
 
@@ -75,17 +86,27 @@ moving time very differently:
    predict speeding up on a downhill, since it costs less energy). `eta`
    and the technical factor are the same per-point values used by the
    Trail strain model below. `base_speed` defaults to 4.0 km/h and is
-   configurable via `-s`/`--speed`.
+   configurable via `-s`/`--speed`. This speed is then further reduced by
+   a **thermal pace penalty** from the simulated temperature and solar
+   radiation at the moment each segment is actually reached — see
+   "Dynamic weather & solar exposure" below.
 
 Hydration need is computed under both models (duration × the calibrated
 Zone 2 burn rate, plus the 0.5 L reserve), and the console/HTML both show
-the difference between the two duration estimates.
+the difference between the two duration estimates. This is separate from
+the fully dynamic, per-segment water total described below.
 
 In the HTML, the "OSM Terrain & Grade Adjusted" tile's popup has a base
-speed slider (since the model is exactly proportional to it, the browser
-just rescales the server-computed duration rather than re-integrating every
-segment). See "Interactive sliders" below for how this and the water
-slider interact and persist.
+speed slider. Since terrain/grade alone scale duration exactly
+proportionally to speed, the browser rescales the server-computed duration
+rather than re-integrating every segment — but this is now an
+**approximation**, since the thermal penalty technically depends on *when*
+(clock time) a faster or slower pace reaches each segment. In practice the
+weather changes slowly enough over a same-day hike that this is a small
+effect; the start time, finish time and weather figures in that popup
+reflect the original command-line `-s` value, not the slider. See
+"Interactive sliders" below for how this and the water slider interact and
+persist.
 
 ## Difficulty ratings
 
@@ -183,6 +204,57 @@ pavement.
   tool warns and falls back to `surface: "unknown"`, `sac_scale: "none"` for
   every point — the run always completes.
 
+## Dynamic weather & solar exposure
+
+The tool fetches an hourly forecast (temperature, direct solar radiation,
+cloud cover) from the free [Open-Meteo API](https://open-meteo.com/) — no
+key required — for this route's centroid, covering today plus the next
+16 days in one request, and simulates walking through it minute by minute
+from `--date`/`--start-time` (default: today, 07:00), rather than assuming
+one flat temperature for the whole hike.
+
+- **Caching**: the raw response is saved as `maps/<gpxBaseName>.weather.json`,
+  loaded on the next run unless `--no-cache` is passed. Since one response
+  already covers 16 days, the same cache serves any `--date` in that
+  range — but it's still a snapshot from whenever it was fetched, so if
+  you're planning several days out, re-fetch closer to the day
+  (`--no-cache`) for a more accurate forecast. If the request fails and no
+  cache exists, the tool falls back to a flat `-t`/`--temp` value with no
+  solar radiation model, and says so.
+- **Date range**: `--date` must be today or within the next 16 days — past
+  dates aren't supported (Open-Meteo's forecast endpoint has no historical
+  data) and dates further out aren't forecast yet. Either case disables
+  the weather/solar simulation for that run with a clear warning, falling
+  back to `-t`/`--temp`.
+- **Simulated clock**: each segment's *actual* time-of-day depends on how
+  long the hike has taken so far, which depends on speed, terrain and the
+  weather already encountered — so a slow, technical section pushes later
+  segments into hotter, more sun-exposed hours than a flat-terrain estimate
+  would predict.
+- **Solar exposure factor**: direct radiation below 100 W/m² (dark/twilight/
+  heavy overcast) applies no increase; 100-500 W/m² scales up to +10%;
+  above 500 W/m² (intense Mediterranean sun) adds up to another +10%. This
+  is then damped by the matched OSM way's tags: fully covered
+  (`tunnel=yes`/`covered=yes`) forces it back to 1.0x; forest/woodland
+  (`natural=wood`/`landuse=forest`, or a rough `tracktype=grade4`/`grade5`
+  track) halves the increase; everything else (open ridges, roads, tracks)
+  gets the full factor. Pass `-e`/`--exposure` to force a constant factor
+  instead of computing it dynamically.
+- **Known limitation**: `natural=wood`/`landuse=forest` are normally OSM
+  *area* tags on separate polygon ways, not tags on the highway way itself.
+  This tool only checks the nearest matched *highway* way's own tags (which
+  occasionally does carry them, and reliably catches `tracktype=grade4/5`),
+  so genuine forest-canopy shading is under-detected rather than requiring
+  full point-in-polygon matching against woodland boundaries.
+- **Thermal pace penalty**: `effective_heat = temp + (radiation / 1000) * 2`
+  combines air temperature with radiant heat load; pace scales down by
+  0.8% per degree above 15°C effective heat, floored at 65% of normal
+  speed, feeding directly into the "OSM Terrain & Grade Adjusted" duration.
+- **Dynamic hydration**: each segment's water need scales with its own
+  local temperature and exposure factor, then sums across the whole route
+  (plus a fixed 0.5 L reserve) — shown alongside the flat static estimate
+  in the console output and the Duration popup.
+
 ## Mechanical descent strain
 
 A steep, loose-surfaced descent loads the quads and knees eccentrically
@@ -243,10 +315,16 @@ The HTML file contains a self-contained, responsive SVG elevation profile:
     (yellow), high (orange) to extreme (dark red) — this can highlight
     rough, technical descents that a pure-gradient view would just show as
     "steep".
+- A thin solar intensity band runs along the top of the chart: dark
+  (shade/twilight), amber (partial sun) or orange (full sun), giving an
+  at-a-glance sense of where along the route — and at what simulated
+  time of day — the sun exposure is highest.
 - Hovering over the profile shows a crosshair at that point, plus a tooltip
   with distance, elevation, instantaneous gradient, surface type, SAC trail
-  scale, the local terrain multiplier (eta) and the relative strain factor
-  (e.g. "1.4x flat equivalent").
+  scale, the local terrain multiplier (eta), the relative strain factor
+  (e.g. "1.4x flat equivalent"), the simulated clock time, ambient
+  temperature, direct solar radiation, the dynamic exposure multiplier
+  (e.g. "1.18x (Full sun)") and the resulting thermal pace penalty.
 - No external assets are loaded; the file can be opened directly in a
   browser or shared as-is.
 

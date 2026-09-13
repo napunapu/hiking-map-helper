@@ -11,6 +11,10 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 
 @Command(
     name = 'ElevationProfiler',
@@ -40,6 +44,12 @@ class Options {
 
     @Option(names = ['-s', '--speed'], description = 'Base flat walking speed in km/h, used for the effort-adjusted duration model (default: 4.0)')
     double speedKmh = 4.0
+
+    @Option(names = ['--start-time'], description = 'Planned hike start time, HH:mm 24h (default: 07:00)')
+    String startTime = '07:00'
+
+    @Option(names = ['--date'], description = 'Planned hike date, yyyy-MM-dd (default: today)')
+    String date
 }
 
 double haversine(double lat1, double lon1, double lat2, double lon2) {
@@ -186,15 +196,173 @@ Map nearestWayInfo(double plat, double plon, List<Map> ways, double thresholdM) 
     }
 
     if (bestTags == null || bestDist > thresholdM) {
-        return [surface: 'unknown', sacScale: 'none', tracktype: 'unknown', highway: 'unknown', distanceM: bestDist]
+        return [surface: 'unknown', sacScale: 'none', tracktype: 'unknown', highway: 'unknown',
+                tunnel: '', covered: '', natural: '', landuse: '', distanceM: bestDist]
     }
 
     String highway = (bestTags.highway ?: 'unknown') as String
     String surface = bestTags.surface ? (bestTags.surface as String) : inferSurfaceFromHighway(highway)
     String sacScale = bestTags.sac_scale ? (bestTags.sac_scale as String) : 'none'
     String tracktype = bestTags.tracktype ? (bestTags.tracktype as String) : 'unknown'
+    String tunnel = (bestTags.tunnel ?: '') as String
+    String covered = (bestTags.covered ?: '') as String
+    String natural = (bestTags.natural ?: '') as String
+    String landuse = (bestTags.landuse ?: '') as String
 
-    [surface: surface, sacScale: sacScale, tracktype: tracktype, highway: highway, distanceM: bestDist]
+    [surface: surface, sacScale: sacScale, tracktype: tracktype, highway: highway,
+     tunnel: tunnel, covered: covered, natural: natural, landuse: landuse, distanceM: bestDist]
+}
+
+Map computeCentroid(List<Map> points) {
+    double lat = points.collect { it.lat as double }.sum() / points.size()
+    double lon = points.collect { it.lon as double }.sum() / points.size()
+    [lat: lat, lon: lon]
+}
+
+String fetchWeatherRaw(double lat, double lon) {
+    // forecast_days=16 (Open-Meteo's maximum) means one cached response stays valid for
+    // any --date within the next 16 days, not just today, without a date-specific query.
+    String url = "https://api.open-meteo.com/v1/forecast?latitude=${String.format(Locale.ROOT, '%.5f', lat)}" +
+        "&longitude=${String.format(Locale.ROOT, '%.5f', lon)}" +
+        '&hourly=temperature_2m,apparent_temperature,direct_radiation,cloud_cover&timezone=auto&forecast_days=16'
+
+    HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
+    HttpRequest request = HttpRequest.newBuilder()
+        .uri(URI.create(url))
+        .timeout(Duration.ofSeconds(30))
+        .GET()
+        .build()
+
+    HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    if (response.statusCode() != 200) {
+        throw new RuntimeException("Open-Meteo request failed with HTTP ${response.statusCode()}: ${response.body()?.take(200)}")
+    }
+    response.body()
+}
+
+Map parseWeatherTimeline(Map weatherData) {
+    if (!weatherData || !weatherData.hourly) {
+        return null
+    }
+    Map hourly = weatherData.hourly as Map
+    if (!hourly.time || !hourly.temperature_2m || !hourly.direct_radiation) {
+        return null
+    }
+    [
+        times: hourly.time as List,
+        temps: (hourly.temperature_2m as List).collect { (it ?: 0.0) as double },
+        radiation: (hourly.direct_radiation as List).collect { (it ?: 0.0) as double }
+    ]
+}
+
+// Linearly interpolates the hourly Open-Meteo timeline at an arbitrary local timestamp,
+// falling back to the nearest end point if the target falls outside the fetched range.
+Map weatherAtTime(Map timeline, LocalDateTime target) {
+    if (!timeline) {
+        return null
+    }
+    List<String> times = timeline.times as List<String>
+    List<Double> temps = timeline.temps as List<Double>
+    List<Double> radiation = timeline.radiation as List<Double>
+    int n = times.size()
+    if (n == 0) {
+        return null
+    }
+
+    DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm")
+    int idx = -1
+    for (int i = 0; i < n; i++) {
+        LocalDateTime t = LocalDateTime.parse(times[i], fmt)
+        if (!t.isBefore(target)) {
+            idx = i
+            break
+        }
+    }
+
+    if (idx == -1) {
+        int last = n - 1
+        return [temp: temps[last], radiation: radiation[last]]
+    }
+    if (idx == 0) {
+        return [temp: temps[0], radiation: radiation[0]]
+    }
+
+    LocalDateTime beforeT = LocalDateTime.parse(times[idx - 1], fmt)
+    LocalDateTime afterT = LocalDateTime.parse(times[idx], fmt)
+    long totalMinutes = Duration.between(beforeT, afterT).toMinutes()
+    long elapsedMinutes = Duration.between(beforeT, target).toMinutes()
+    double frac = totalMinutes > 0 ? Math.max(0.0, Math.min(1.0, elapsedMinutes / (double) totalMinutes)) : 0.0
+
+    double temp = (temps[idx - 1] as double) + ((temps[idx] as double) - (temps[idx - 1] as double)) * frac
+    double rad = (radiation[idx - 1] as double) + ((radiation[idx] as double) - (radiation[idx - 1] as double)) * frac
+
+    [temp: temp, radiation: rad]
+}
+
+// Baseline solar factor from direct radiation alone, before any canopy/terrain damping.
+double baseSunFactorForRadiation(double radiation) {
+    if (radiation < 100.0) {
+        return 1.0
+    }
+    if (radiation <= 500.0) {
+        return 1.0 + (radiation - 100.0) / 400.0 * 0.10
+    }
+    1.10 + Math.min(0.10, (radiation - 500.0) / 500.0 * 0.10)
+}
+
+// Classifies a point's overhead cover from its matched OSM tags: fully covered (tunnel/
+// covered=yes), forested (wood/forest landuse, or a rough grade4/5 track implying dense
+// vegetation), or exposed (everything else - open ridges, roads, tracks without canopy).
+String canopyClassFor(Map point) {
+    String tunnel = (point.tunnel ?: '') as String
+    String covered = (point.covered ?: '') as String
+    String natural = (point.natural ?: '') as String
+    String landuse = (point.landuse ?: '') as String
+    String tracktype = (point.tracktype ?: '') as String
+
+    if (tunnel.equalsIgnoreCase('yes') || covered.equalsIgnoreCase('yes')) {
+        return 'covered'
+    }
+    if (natural.equalsIgnoreCase('wood') || landuse.equalsIgnoreCase('forest') || tracktype in ['grade4', 'grade5']) {
+        return 'forest'
+    }
+    'exposed'
+}
+
+double effectiveExposureFor(String canopyClass, double baseSunFactor) {
+    if (canopyClass == 'covered') {
+        return 1.0
+    }
+    if (canopyClass == 'forest') {
+        return 1.0 + (baseSunFactor - 1.0) * 0.5
+    }
+    baseSunFactor
+}
+
+String sunLabelFor(String canopyClass, double radiation) {
+    if (canopyClass == 'covered') {
+        return 'Covered'
+    }
+    if (canopyClass == 'forest') {
+        return 'Forest shade'
+    }
+    if (radiation < 100.0) {
+        return 'Shade/twilight'
+    }
+    if (radiation <= 500.0) {
+        return 'Partial sun'
+    }
+    'Full sun'
+}
+
+String solarBandColour(double radiation) {
+    if (radiation < 100.0) {
+        return '#37474F'
+    }
+    if (radiation <= 500.0) {
+        return '#FFB300'
+    }
+    '#FF6F00'
 }
 
 // Terrain factor (eta): how much harder a surface is to move over than firm pavement,
@@ -335,8 +503,10 @@ Map durationComparison(double dinDurationHours, double effortDurationHours, doub
         'The effort-adjusted model integrates a per-segment speed derived from Tobler\'s hiking ' +
         'function (slowing for both steep climbs and steep descents, rather than assuming a fixed ' +
         '800 m/h descent rate), divided by the terrain factor (eta) and technical factor (T-factor) ' +
-        'at each point from the matched OpenStreetMap surface and SAC scale. Rough or technical ' +
-        'descents are explicitly slowed rather than sped up, unlike a pure energy-cost model.'
+        'at each point from the matched OpenStreetMap surface and SAC scale, then further slowed by ' +
+        'a thermal pace penalty from the simulated ambient temperature and solar radiation at the ' +
+        'time each segment is reached. Rough, technical or hot, sun-exposed sections are explicitly ' +
+        'slowed rather than sped up, unlike a pure energy-cost model.'
     )
 
     [
@@ -344,6 +514,34 @@ Map durationComparison(double dinDurationHours, double effortDurationHours, doub
         deltaMinutes: deltaMinutes, dinConsumption: dinConsumption, effortConsumption: effortConsumption,
         dinPaceKmh: dinPaceKmh, effortPaceKmh: effortPaceKmh, reserveVolume: reserveVolume,
         baseSpeedKmh: baseSpeedKmh, reason: reason
+    ]
+}
+
+Map dynamicWeatherSummary(LocalDateTime startDateTime, LocalDateTime finishDateTime, double startTemp, double peakTemp, double maxRadiation, double dynamicWaterLitres, double staticCarry, boolean weatherMatched) {
+    DateTimeFormatter clockFmt = DateTimeFormatter.ofPattern('HH:mm')
+    double dynamicCarry = Math.round((dynamicWaterLitres + 0.5) * 10.0) / 10.0
+
+    String reason = weatherMatched
+        ? String.format(
+            Locale.ROOT,
+            'Simulated from a %s start using live Open-Meteo hourly forecast data (temperature, direct ' +
+            'solar radiation, cloud cover) at this route\'s midpoint location, combined with the matched ' +
+            'OpenStreetMap canopy (tunnels, forest, open ridges) to estimate real sun exposure and heat ' +
+            'load per segment, rather than a single flat assumption for the whole hike.',
+            startDateTime.format(clockFmt)
+          )
+        : String.format(
+            Locale.ROOT,
+            'No live forecast data was available, so this uses a flat %.0f degC (-t/--temp) with no solar ' +
+            'radiation model for the whole hike, starting at %s.',
+            startTemp, startDateTime.format(clockFmt)
+          )
+
+    [
+        startTime: startDateTime.format(clockFmt), finishTime: finishDateTime.format(clockFmt),
+        startTemp: startTemp, peakTemp: peakTemp, maxRadiation: maxRadiation,
+        dynamicWaterLitres: dynamicWaterLitres, dynamicCarry: dynamicCarry, staticCarry: staticCarry,
+        weatherMatched: weatherMatched, reason: reason
     ]
 }
 
@@ -486,7 +684,7 @@ String formatDuration(double hours) {
     String.format(Locale.ROOT, '%dh %02dmin', h, m)
 }
 
-void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult) {
+void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult, Map dynamicResult) {
     println '=== Elevation profile summary ==='
     println String.format(Locale.ROOT, 'Total distance : %.2f km', distanceKm)
     println String.format(Locale.ROOT, 'Total ascent   : %.0f m', ascent)
@@ -497,6 +695,14 @@ void printSummary(double distanceKm, double ascent, double descent, double durat
     println "Effort-adjusted duration : ${formatDuration(durationResult.effortDurationHours as double)} (delta: ${deltaSign}${Math.round(Math.abs(deltaMinutes)) as int} min)"
     println String.format(Locale.ROOT, 'DIN hydration need       : %.1f L', durationResult.dinConsumption as double)
     println String.format(Locale.ROOT, 'Effort-adjusted hydration: %.1f L', durationResult.effortConsumption as double)
+    println "Weather data     : ${dynamicResult.weatherMatched ? 'Live Open-Meteo forecast' : 'No forecast data; using static -t/--temp value'}"
+    println "Start time       : ${dynamicResult.startTime}"
+    println "Est. finish time : ${dynamicResult.finishTime}"
+    println String.format(Locale.ROOT, 'Start temperature : %.1f degC', dynamicResult.startTemp as double)
+    println String.format(Locale.ROOT, 'Peak temperature  : %.1f degC', dynamicResult.peakTemp as double)
+    println String.format(Locale.ROOT, 'Max solar radiation: %.0f W/m2', dynamicResult.maxRadiation as double)
+    println String.format(Locale.ROOT, 'Dynamic water need : %.1f L (vs flat static estimate %.1f L)', dynamicResult.dynamicCarry as double, dynamicResult.staticCarry as double)
+    println "Reason           : ${dynamicResult.reason}"
     println "Trail data      : ${trailInfo.matched ? 'Matched to OpenStreetMap (surface/SAC scale available)' : 'Raw GPX (no OSM match; surface/SAC scale unknown)'}"
     println "Difficulty      : ${difficultyResult.tier}"
     println "Reason          : ${difficultyResult.reason}"
@@ -626,7 +832,7 @@ String buildWaterChart(List<Map> chartData, double maxScaleLitres) {
 ${bars}</svg>"""
 }
 
-String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult) {
+String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult, Map dynamicResult) {
     String difficulty = difficultyResult.tier
     String difficultyReason = difficultyResult.reason
     double maxGrade = difficultyResult.maxGrade as double
@@ -668,6 +874,14 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     double durationBaseSpeedKmh = durationResult.baseSpeedKmh as double
     double durationReserveVolume = durationResult.reserveVolume as double
     String durationReason = durationResult.reason
+    String dynamicStartTime = dynamicResult.startTime
+    String dynamicFinishTime = dynamicResult.finishTime
+    double dynamicStartTemp = dynamicResult.startTemp as double
+    double dynamicPeakTemp = dynamicResult.peakTemp as double
+    double dynamicMaxRadiation = dynamicResult.maxRadiation as double
+    double dynamicCarry = dynamicResult.dynamicCarry as double
+    double dynamicStaticCarry = dynamicResult.staticCarry as double
+    String dynamicReason = dynamicResult.reason
     int width = 1100
     int height = 420
     int padding = 50
@@ -685,6 +899,9 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     StringBuilder segments = new StringBuilder()
     StringBuilder strainSegments = new StringBuilder()
     StringBuilder hitAreas = new StringBuilder()
+    StringBuilder solarBand = new StringBuilder()
+    int solarBandHeight = 8
+    int solarBandY = padding - 14
 
     for (int i = 1; i < points.size(); i++) {
         Map p0 = points[i - 1]
@@ -702,14 +919,27 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         segments << "<polygon points=\"${polyPoints}\" fill=\"${colour}\" stroke=\"${colour}\" stroke-width=\"0.5\" />\n"
         strainSegments << "<polygon points=\"${polyPoints}\" fill=\"${strainCol}\" stroke=\"${strainCol}\" stroke-width=\"0.5\" />\n"
 
+        double radiation = (p1.radiation ?: 0.0) as double
+        String solarCol = solarBandColour(radiation)
+        double solarWidth = Math.max(1.0d, Math.abs(x1 - x0))
+        solarBand << "<rect x=\"${fmt(Math.min(x0, x1))}\" y=\"${solarBandY}\" width=\"${fmt(solarWidth)}\" height=\"${solarBandHeight}\" fill=\"${solarCol}\" opacity=\"0.85\" />\n"
+
         double distKm = (p1.distance as double) / 1000.0
         String surface = (p1.surface ?: 'unknown') as String
         String sacScale = (p1.sacScale ?: 'unknown') as String
         double eta = p1.eta as double
         double strainFactor = p1.strainFactor as double
+        String clockTime = (p1.clockTime ?: '--:--') as String
+        double ambientTemp = (p1.ambientTemp ?: 0.0) as double
+        double segExposure = (p1.exposureFactor ?: 1.0) as double
+        double thermalPenaltyPct = (p1.thermalPenaltyPct ?: 0.0) as double
+        String sunLabel = (p1.sunLabel ?: 'Unknown') as String
         String tooltip = String.format(
-            Locale.ROOT, '%.2f km | %.0f m | %.1f%% | surface: %s | SAC: %s | eta: %.2f | strain: %.1fx flat equivalent',
-            distKm, p1.smoothedEle as double, p1.grade as double, surface, sacScale, eta, strainFactor
+            Locale.ROOT,
+            '%.2f km | %.0f m | %.1f%% | surface: %s | SAC: %s | eta: %.2f | strain: %.1fx flat equivalent | ' +
+            '%s | %.1f degC | %.0f W/m2 | %.2fx (%s) | pace -%.0f%%',
+            distKm, p1.smoothedEle as double, p1.grade as double, surface, sacScale, eta, strainFactor,
+            clockTime, ambientTemp, radiation, segExposure, sunLabel, thermalPenaltyPct
         )
         hitAreas << "<rect x=\"${fmt(Math.min(x0, x1))}\" y=\"${padding}\" width=\"${fmt(Math.max(1.0d, Math.abs(x1 - x0)))}\" height=\"${plotHeight}\" fill=\"transparent\" data-tip=\"${escapeXml(tooltip)}\" data-x=\"${fmt(x1)}\" onmousemove=\"showTip(event)\" onmouseleave=\"hideTip()\" />\n"
     }
@@ -910,12 +1140,17 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
                 ${strainSegments}
                 ${strainLegend}
             </g>
+            <g id="solar-band">
+                ${solarBand}
+            </g>
             ${hitAreas}
             <line id="crosshair" x1="0" y1="${padding}" x2="0" y2="${padding + plotHeight}" />
         </svg>
         <div id="tooltip"></div>
     </div>
+    <p class="trail-data-note">Solar intensity band along the top of the chart: dark = shade/twilight, amber = partial sun, orange = full sun.</p>
     <p class="trail-data-note">${trailMatched ? 'Trail data: matched to OpenStreetMap (surface/SAC scale available).' : 'Trail data: no OpenStreetMap match (surface/SAC scale unknown).'}</p>
+    <p class="trail-data-note">${dynamicResult.weatherMatched ? 'Weather data: live Open-Meteo forecast.' : 'Weather data: no forecast available (flat static temperature assumed).'}</p>
     <div id="difficulty-modal" class="modal-overlay" onclick="hideDifficultyInfo()">
         <div class="modal-box" onclick="event.stopPropagation()">
             <h2>Why "${difficulty}"?</h2>
@@ -1042,6 +1277,20 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
                 ${durationDeltaMinutes >= 0
                     ? "The terrain-adjusted estimate is ${Math.round(durationDeltaMinutes) as int} min longer than DIN 33466."
                     : "The terrain-adjusted estimate is ${Math.round(-durationDeltaMinutes) as int} min shorter than DIN 33466."}
+            </p>
+            <table>
+                <tr><th colspan="2">Simulated weather &amp; solar exposure</th></tr>
+                <tr><td>Start time</td><td>${dynamicStartTime}</td></tr>
+                <tr><td>Estimated finish time</td><td>${dynamicFinishTime}</td></tr>
+                <tr><td>Start / peak temperature</td><td>${String.format(Locale.ROOT, '%.1f / %.1f degC', dynamicStartTemp, dynamicPeakTemp)}</td></tr>
+                <tr><td>Max solar radiation</td><td>${String.format(Locale.ROOT, '%.0f W/m2', dynamicMaxRadiation)}</td></tr>
+                <tr><td>Dynamic water need (vs flat static)</td><td>${String.format(Locale.ROOT, '%.1f L (vs %.1f L)', dynamicCarry, dynamicStaticCarry)}</td></tr>
+            </table>
+            <p style="font-size: 12px; color: #666;">${escapeXml(dynamicReason)}</p>
+            <p style="font-size: 11px; color: #999;">
+                Start/finish time and the weather figures reflect the base speed set on the command
+                line; the slider above only rescales the terrain-adjusted duration/pace/hydration
+                figures, not the simulated clock.
             </p>
             <button onclick="hideDurationInfo()">Close</button>
         </div>
@@ -1331,6 +1580,41 @@ if (!options.gpxFile.exists()) {
     System.exit(1)
 }
 
+// -e/--exposure defaults to 1.0, which is indistinguishable from a genuinely computed
+// dynamic exposure of 1.0 - so explicit presence on the command line (not just the value)
+// is what triggers treating it as a constant override for the dynamic solar model.
+boolean exposureExplicit = cmd.getParseResult().matchedOptions().any { it.names().contains('-e') }
+
+LocalTime startLocalTime
+try {
+    startLocalTime = LocalTime.parse(options.startTime, DateTimeFormatter.ofPattern('HH:mm'))
+} catch (Exception ex) {
+    System.err.println("Invalid --start-time '${options.startTime}', expected HH:mm; using 07:00.")
+    startLocalTime = LocalTime.of(7, 0)
+}
+
+LocalDate today = LocalDate.now()
+LocalDate startLocalDate = today
+if (options.date) {
+    try {
+        startLocalDate = LocalDate.parse(options.date, DateTimeFormatter.ofPattern('yyyy-MM-dd'))
+    } catch (Exception ex) {
+        System.err.println("Invalid --date '${options.date}', expected yyyy-MM-dd; using today.")
+        startLocalDate = today
+    }
+}
+
+// Open-Meteo's forecast endpoint has no historical data and only extends 16 days ahead
+// (see fetchWeatherRaw), so dates outside that window can't be simulated meaningfully.
+boolean dateWithinForecastRange = !startLocalDate.isBefore(today) && !startLocalDate.isAfter(today.plusDays(16))
+if (startLocalDate.isBefore(today)) {
+    System.err.println("--date ${startLocalDate} is in the past; Open-Meteo has no historical forecast data, so weather simulation is disabled for this run (using static -t/--temp instead).")
+} else if (startLocalDate.isAfter(today.plusDays(16))) {
+    System.err.println("--date ${startLocalDate} is more than 16 days ahead; Open-Meteo's forecast doesn't reach that far, so weather simulation is disabled for this run (using static -t/--temp instead).")
+}
+
+LocalDateTime startDateTime = LocalDateTime.of(startLocalDate, startLocalTime)
+
 List<Map> points = parseGpx(options.gpxFile)
 if (points.size() < 2) {
     System.err.println('GPX file must contain at least two track points.')
@@ -1366,6 +1650,30 @@ List<Map> osmWays = parseOsmWays(osmData)
 Map trailInfo = [matched: !osmWays.isEmpty(), source: matchSource]
 double surfaceSnapThresholdM = 30.0
 
+File weatherCacheFile = new File(mapsDir, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '.weather.json')
+Map weatherData = null
+
+if (!dateWithinForecastRange) {
+    // Already warned above; no point querying (or trusting a stale cache against) a date
+    // Open-Meteo's forecast endpoint can't actually cover.
+} else if (!options.noCache && weatherCacheFile.exists()) {
+    weatherData = new JsonSlurper().parse(weatherCacheFile) as Map
+    println "Loaded weather data from local cache: maps/${weatherCacheFile.name}"
+} else {
+    try {
+        Map centroid = computeCentroid(points)
+        String rawJson = fetchWeatherRaw(centroid.lat as double, centroid.lon as double)
+        weatherCacheFile.text = rawJson
+        weatherData = new JsonSlurper().parseText(rawJson) as Map
+        println 'Fetched and cached weather data from Open-Meteo'
+    } catch (Exception ex) {
+        System.err.println("Open-Meteo request failed (${ex.message}); using static -t/--temp value with no solar radiation model.")
+    }
+}
+
+Map weatherTimeline = parseWeatherTimeline(weatherData)
+boolean weatherMatched = weatherTimeline != null
+
 List<Double> smoothedEle = movingAverage(points.collect { it.ele as double }, options.window)
 for (int i = 0; i < points.size(); i++) {
     points[i].smoothedEle = smoothedEle[i]
@@ -1385,6 +1693,10 @@ for (int i = 0; i < points.size(); i++) {
     points[i].sacScale = wayInfo.sacScale
     points[i].tracktype = wayInfo.tracktype
     points[i].highway = wayInfo.highway
+    points[i].tunnel = wayInfo.tunnel
+    points[i].covered = wayInfo.covered
+    points[i].natural = wayInfo.natural
+    points[i].landuse = wayInfo.landuse
     points[i].eta = terrainFactorForSurface(wayInfo.surface as String)
     points[i].tFactor = technicalFactorForSacScale(wayInfo.sacScale as String)
 }
@@ -1404,11 +1716,30 @@ double totalMetabolicCostM = 0.0
 double totalBrakingIndex = 0.0
 double highStrainDescentDistanceM = 0.0
 double totalEffortDurationHours = 0.0
+double totalDynamicWaterLitres = 0.0
+double simulatedElapsedHours = 0.0
+double startTempEncountered = options.tempCelsius
+double peakTempEncountered = options.tempCelsius
+double maxRadiationEncountered = 0.0
 Map<String, Double> surfaceDistanceM = [:].withDefault { 0.0 }
 points[0].grade = 0.0
 points[0].strainFactor = 1.0
 points[0].strainIntensity = 1.0
+points[0].clockTime = startDateTime.format(DateTimeFormatter.ofPattern('HH:mm'))
+points[0].ambientTemp = options.tempCelsius
+points[0].radiation = 0.0
+points[0].exposureFactor = 1.0
+points[0].thermalPenaltyPct = 0.0
+points[0].sunLabel = 'Shade/twilight'
 int gradeRef = 0
+
+if (weatherMatched) {
+    Map startWeather = weatherAtTime(weatherTimeline, startDateTime)
+    if (startWeather) {
+        startTempEncountered = startWeather.temp as double
+        peakTempEncountered = startTempEncountered
+    }
+}
 for (int i = 1; i < points.size(); i++) {
     double deltaEle = (points[i].smoothedEle as double) - (points[i - 1].smoothedEle as double)
     if (deltaEle > 0) {
@@ -1478,8 +1809,42 @@ for (int i = 1; i < points.size(); i++) {
     // Effort-adjusted duration: integrate a per-segment speed (Tobler's hiking function,
     // scaled by the same terrain/technical factors) rather than DIN 33466's fixed rates.
     double slopeFactor = slopeSpeedFactor(gradeFraction)
-    double vSegKmh = options.speedKmh * slopeFactor / (eta * tFactor)
-    totalEffortDurationHours += (segDist / 1000.0) / vSegKmh
+    double vSegEffort = options.speedKmh * slopeFactor / (eta * tFactor)
+
+    // Dynamic solar exposure and thermal pace degradation: look up the forecast at the
+    // clock time this segment is actually reached (i.e. simulated, pace-dependent), not a
+    // single flat assumption for the whole hike.
+    LocalDateTime segClock = startDateTime.plusSeconds(Math.round(simulatedElapsedHours * 3600.0))
+    Map segWeather = weatherMatched ? weatherAtTime(weatherTimeline, segClock) : null
+    double segTemp = segWeather ? segWeather.temp as double : options.tempCelsius
+    double segRadiation = segWeather ? segWeather.radiation as double : 0.0
+
+    peakTempEncountered = Math.max(peakTempEncountered, segTemp)
+    maxRadiationEncountered = Math.max(maxRadiationEncountered, segRadiation)
+
+    double baseSunFactor = baseSunFactorForRadiation(segRadiation)
+    String canopyClass = canopyClassFor(points[i])
+    double dynamicExposure = effectiveExposureFor(canopyClass, baseSunFactor)
+    double segExposure = exposureExplicit ? options.exposureFactor : dynamicExposure
+
+    double effectiveHeat = segTemp + (segRadiation / 1000.0) * 2.0
+    double thermalFactor = Math.max(0.65, 1.0 - Math.max(0.0, effectiveHeat - 15.0) * 0.008)
+    double vSegThermal = vSegEffort * thermalFactor
+    double segDistKm = segDist / 1000.0
+    double tSegHours = segDistKm / vSegThermal
+
+    totalEffortDurationHours += tSegHours
+    simulatedElapsedHours += tSegHours
+
+    double segHourlyRate = (0.35 + Math.max(0.0, segTemp - 15.0) * 0.02) * segExposure
+    totalDynamicWaterLitres += tSegHours * segHourlyRate
+
+    points[i].clockTime = segClock.format(DateTimeFormatter.ofPattern('HH:mm'))
+    points[i].ambientTemp = segTemp
+    points[i].radiation = segRadiation
+    points[i].exposureFactor = segExposure
+    points[i].thermalPenaltyPct = (1.0 - thermalFactor) * 100.0
+    points[i].sunLabel = sunLabelFor(canopyClass, segRadiation)
 }
 
 Map descentStrain = [
@@ -1495,9 +1860,11 @@ Map shenandoahResult = shenandoahDifficulty(totalAscent, totalDistanceKm)
 Map waterResult = waterIntakeRecommendation(durationHours, options.tempCelsius, options.exposureFactor)
 Map trailStrain = trailStrainSummary(totalMetabolicCostM / 1000.0, totalDistanceKm, totalBrakingIndex, highStrainDescentDistanceM / 1000.0, surfaceDistanceM, cumulative)
 Map durationResult = durationComparison(durationHours, totalEffortDurationHours, totalDistanceKm, waterResult.activeHourlyRate as double, options.speedKmh)
+LocalDateTime finishDateTime = startDateTime.plusSeconds(Math.round(totalEffortDurationHours * 3600.0))
+Map dynamicResult = dynamicWeatherSummary(startDateTime, finishDateTime, startTempEncountered, peakTempEncountered, maxRadiationEncountered, totalDynamicWaterLitres, waterResult.recommendedCarry as double, weatherMatched)
 
-printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult)
+printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult)
 
 File output = options.outputPath ? new File(options.outputPath) : new File(options.gpxFile.absoluteFile.parentFile, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '-profile.html')
-output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult)
+output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult)
 println "Elevation profile written to: ${output.absolutePath}"
