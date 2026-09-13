@@ -949,22 +949,19 @@ println String.format(Locale.ROOT, 'Step 2 - slope response on firm terrain (des
 
 // Anchor points for the calibrated slope-response curve, as (grade %, speed factor relative
 // to v_base), sorted by grade and pinned flat at (0, 1.0) since v_base is that point by
-// construction. A bracket with no firm samples falls back to the theoretical Tobler ratio at
-// a representative grade (flagged above by its absence from the step 2 listing).
-List<Map> slopeAnchors = [
-    [grade: -20.0, factor: slopeSpeedFactor(-0.20)], [grade: -10.0, factor: slopeSpeedFactor(-0.10)],
-    [grade: 0.0, factor: 1.0],
-    [grade: 10.0, factor: slopeSpeedFactor(0.10)], [grade: 20.0, factor: slopeSpeedFactor(0.20)]
-]
-[severeDescentAnchor, moderateDescentAnchor, moderateClimbAnchor, severeClimbAnchor].each { anchor ->
-    if (anchor == null || vBaseCalibrated <= 0) {
-        return
-    }
-    double grade = anchor.grade as double
-    slopeAnchors.removeAll { Math.abs((it.grade as double) - grade) < 0.01 }
-    slopeAnchors << [grade: grade, factor: (anchor.speedKmh as double) / vBaseCalibrated]
+// construction. Each bracket contributes exactly one anchor - its calibrated one where firm
+// samples exist, otherwise the theoretical Tobler ratio at a representative grade - so the
+// fallback and calibrated values for the same bracket never both end up in the curve.
+Closure<Map> slopeAnchorFor = { double fallbackGrade, Map anchor ->
+    (anchor != null && vBaseCalibrated > 0)
+        ? [grade: anchor.grade as double, factor: (anchor.speedKmh as double) / vBaseCalibrated]
+        : [grade: fallbackGrade, factor: slopeSpeedFactor(fallbackGrade / 100.0)]
 }
-slopeAnchors = slopeAnchors.sort { it.grade as double }
+List<Map> slopeAnchors = [
+    slopeAnchorFor(-20.0, severeDescentAnchor), slopeAnchorFor(-10.0, moderateDescentAnchor),
+    [grade: 0.0, factor: 1.0],
+    slopeAnchorFor(10.0, moderateClimbAnchor), slopeAnchorFor(20.0, severeClimbAnchor)
+].sort { it.grade as double }
 
 Closure<Double> calibratedSlopeFactor = { double grade ->
     if (grade <= (slopeAnchors[0].grade as double)) {
