@@ -1285,6 +1285,19 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         grid << "<text x=\"${padding - 8}\" y=\"${fmt(y + 4)}\" text-anchor=\"end\" font-size=\"11\" fill=\"#666\">${Math.round(ele)} m</text>\n"
     }
 
+    // Kilometre scale along the bottom: a light tick every kmTickInterval km, widened as the
+    // route gets longer so labels stay legible instead of overlapping.
+    double maxDistanceKm = maxDistance / 1000.0
+    double kmTickInterval = maxDistanceKm > 60.0 ? 10.0 : maxDistanceKm > 30.0 ? 5.0 : maxDistanceKm > 15.0 ? 2.0 : 1.0
+    int kmTickCount = Math.floor(maxDistanceKm / kmTickInterval) as int
+    double axisY = padding + plotHeight
+    for (int t = 0; t <= kmTickCount; t++) {
+        double km = t * kmTickInterval
+        double x = xFor(km * 1000.0)
+        grid << "<line x1=\"${fmt(x)}\" y1=\"${fmt(axisY)}\" x2=\"${fmt(x)}\" y2=\"${fmt(axisY + 6)}\" stroke=\"#999\" stroke-width=\"1\" />\n"
+        grid << "<text x=\"${fmt(x)}\" y=\"${fmt(axisY + 20)}\" text-anchor=\"middle\" font-size=\"11\" fill=\"#666\">${String.format(Locale.ROOT, '%.0f km', km)}</text>\n"
+    }
+
     String legend = buildLegend(width, height, padding)
     String strainLegend = buildStrainLegend(width, height, padding)
 
