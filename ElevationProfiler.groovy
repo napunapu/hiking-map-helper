@@ -90,11 +90,14 @@ Map computeBoundingBox(List<Map> points) {
     [minLat: minLat, minLon: minLon, maxLat: maxLat, maxLon: maxLon]
 }
 
+// Fetches highway ways (for surface/tracktype/smoothness matching) alongside high-friction
+// natural landcover features (beach/sand/scree/bare_rock) in the same request, since both
+// feed the surface-resolution hierarchy below - see resolveSurfaceAndEta.
 String buildOverpassQuery(Map bbox) {
     String bboxStr = [bbox.minLat, bbox.minLon, bbox.maxLat, bbox.maxLon]
         .collect { String.format(Locale.ROOT, '%.6f', it as double) }
         .join(',')
-    "[out:json][timeout:30];\nway[\"highway\"](${bboxStr});\nout tags geom;"
+    "[out:json][timeout:35];\n(\n  way[\"highway\"](${bboxStr});\n  wr[\"natural\"~\"^(beach|sand|scree|bare_rock)\$\"](${bboxStr});\n);\nout tags geom;"
 }
 
 String fetchOverpassRaw(Map bbox) {
@@ -117,6 +120,9 @@ String fetchOverpassRaw(Map bbox) {
     response.body()
 }
 
+// The Overpass response now mixes highway ways and natural-landcover ways/relations in one
+// element list (see buildOverpassQuery), so this filters to highway ways only - landcover
+// features are parsed separately by parseLandcoverFeatures below.
 List<Map> parseOsmWays(Map osmData) {
     if (!osmData || !osmData.elements) {
         return []
@@ -124,7 +130,8 @@ List<Map> parseOsmWays(Map osmData) {
     // Overpass's "geom" query keyword requests full geometry, but the JSON response
     // key for a way's coordinate list is "geometry", not "geom".
     (osmData.elements as List).findAll { el ->
-        (el as Map).type == 'way' && (el as Map).geometry
+        Map e = el as Map
+        e.type == 'way' && e.geometry && ((e.tags ?: [:]) as Map).highway
     }.collect { el ->
         Map e = el as Map
         [
@@ -134,21 +141,34 @@ List<Map> parseOsmWays(Map osmData) {
     }
 }
 
-// OSM mappers very often record a rural trail's existence (track/path/footway/...) without
-// ever adding a surface tag - defaulting that gap to "unknown" (the model's lowest, most
-// generic terrain penalty) systematically understates difficulty on routes with sparse
-// tagging, which some GR92 stages have plenty of. 'ground' is a reasonable unpaved-trail
-// default until a secondary data source can confirm the actual surface - see TODO.md.
-String inferSurfaceFromHighway(String highway) {
-    Set<String> paved = ['residential', 'primary', 'secondary', 'tertiary', 'unclassified', 'living_street', 'service', 'trunk', 'motorway'] as Set
-    Set<String> unpavedTrail = ['track', 'path', 'footway', 'bridleway', 'steps'] as Set
-    if (highway && paved.contains(highway)) {
-        return 'paved'
+// High-friction natural landcover (beach/sand/scree/bare_rock), used as a fallback surface
+// signal (tier 4) when a matched way has no surface/tracktype/smoothness tag. Relations (used
+// for larger multipolygon areas, e.g. a long beach) are approximated as the union of their
+// member ways' geometry rather than resolved into proper outer/inner rings - close enough for
+// a containment/proximity check at this scale.
+List<Map> parseLandcoverFeatures(Map osmData) {
+    if (!osmData || !osmData.elements) {
+        return []
     }
-    if (highway && unpavedTrail.contains(highway)) {
-        return 'ground'
+    Set<String> landcoverValues = ['beach', 'sand', 'scree', 'bare_rock'] as Set
+    List<Map> features = []
+    (osmData.elements as List).each { el ->
+        Map e = el as Map
+        Map tags = (e.tags ?: [:]) as Map
+        String natural = (tags.natural ?: '') as String
+        if (!landcoverValues.contains(natural)) {
+            return
+        }
+        if (e.type == 'way' && e.geometry) {
+            features << [natural: natural, geom: (e.geometry as List).collect { g -> [lat: (g as Map).lat as double, lon: (g as Map).lon as double] }]
+        } else if (e.type == 'relation' && e.members) {
+            (e.members as List).findAll { m -> (m as Map).geometry }.each { m ->
+                Map member = m as Map
+                features << [natural: natural, geom: (member.geometry as List).collect { g -> [lat: (g as Map).lat as double, lon: (g as Map).lon as double] }]
+            }
+        }
     }
-    'unknown'
+    features
 }
 
 // A local equirectangular projection is accurate enough at the scale of a 30 m matching
@@ -177,6 +197,9 @@ double pointToSegmentDistanceM(double plat, double plon, double alat, double alo
     Math.sqrt(ddx * ddx + ddy * ddy)
 }
 
+// Finds the nearest highway way within thresholdM and returns its raw tags (empty if nothing
+// is close enough) - the surface-resolution hierarchy below reads whichever tags it needs
+// directly, rather than this function pre-deciding a single surface value.
 Map nearestWayInfo(double plat, double plon, List<Map> ways, double thresholdM) {
     double latPad = thresholdM / 110540.0
     double lonPad = thresholdM / (111320.0 * Math.cos(Math.toRadians(plat)))
@@ -210,22 +233,68 @@ Map nearestWayInfo(double plat, double plon, List<Map> ways, double thresholdM) 
         }
     }
 
-    if (bestTags == null || bestDist > thresholdM) {
-        return [surface: 'unknown', sacScale: 'none', tracktype: 'unknown', highway: 'unknown',
-                tunnel: '', covered: '', natural: '', landuse: '', distanceM: bestDist]
+    (bestTags != null && bestDist <= thresholdM) ? [tags: bestTags, distanceM: bestDist] : [tags: [:], distanceM: bestDist]
+}
+
+// Standard ray-casting point-in-polygon test, accurate enough for a lat/lon ring at this
+// scale. Only meaningful for a closed ring (first point == last point) - see landcoverMatchFor.
+boolean pointInPolygon(double plat, double plon, List<Map> ring) {
+    boolean inside = false
+    int n = ring.size()
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        double yi = ring[i].lat as double
+        double xi = ring[i].lon as double
+        double yj = ring[j].lat as double
+        double xj = ring[j].lon as double
+        boolean edgeCrossesRay = (yi > plat) != (yj > plat)
+        if (edgeCrossesRay && plon < (xj - xi) * (plat - yi) / (yj - yi) + xi) {
+            inside = !inside
+        }
+    }
+    inside
+}
+
+// Tier 4 lookup: is this point inside, or within thresholdM of, a mapped high-friction
+// landcover feature? Checks containment against closed rings first (a proper area), then
+// falls back to edge proximity for every feature (covers both a point just outside a beach
+// polygon's boundary, and an open way like scree mapped as a line along a slope).
+Map landcoverMatchFor(double plat, double plon, List<Map> landcoverFeatures, double thresholdM) {
+    for (feature in landcoverFeatures) {
+        List<Map> ring = feature.geom as List<Map>
+        boolean closed = ring.size() >= 3 &&
+            Math.abs((ring[0].lat as double) - (ring[-1].lat as double)) < 1e-9 &&
+            Math.abs((ring[0].lon as double) - (ring[-1].lon as double)) < 1e-9
+        if (closed && pointInPolygon(plat, plon, ring)) {
+            return [natural: feature.natural as String, distanceM: 0.0]
+        }
     }
 
-    String highway = (bestTags.highway ?: 'unknown') as String
-    String surface = bestTags.surface ? (bestTags.surface as String) : inferSurfaceFromHighway(highway)
-    String sacScale = bestTags.sac_scale ? (bestTags.sac_scale as String) : 'none'
-    String tracktype = bestTags.tracktype ? (bestTags.tracktype as String) : 'unknown'
-    String tunnel = (bestTags.tunnel ?: '') as String
-    String covered = (bestTags.covered ?: '') as String
-    String natural = (bestTags.natural ?: '') as String
-    String landuse = (bestTags.landuse ?: '') as String
+    double latPad = thresholdM / 110540.0
+    double lonPad = thresholdM / (111320.0 * Math.cos(Math.toRadians(plat)))
+    double bestDist = Double.MAX_VALUE
+    String bestNatural = null
+    for (feature in landcoverFeatures) {
+        List<Map> ring = feature.geom as List<Map>
+        for (int i = 1; i < ring.size(); i++) {
+            double aLat = ring[i - 1].lat as double
+            double aLon = ring[i - 1].lon as double
+            double bLat = ring[i].lat as double
+            double bLon = ring[i].lon as double
+            if (Math.min(aLat, bLat) - latPad > plat || Math.max(aLat, bLat) + latPad < plat) {
+                continue
+            }
+            if (Math.min(aLon, bLon) - lonPad > plon || Math.max(aLon, bLon) + lonPad < plon) {
+                continue
+            }
+            double d = pointToSegmentDistanceM(plat, plon, aLat, aLon, bLat, bLon)
+            if (d < bestDist) {
+                bestDist = d
+                bestNatural = feature.natural as String
+            }
+        }
+    }
 
-    [surface: surface, sacScale: sacScale, tracktype: tracktype, highway: highway,
-     tunnel: tunnel, covered: covered, natural: natural, landuse: landuse, distanceM: bestDist]
+    (bestNatural != null && bestDist <= thresholdM) ? [natural: bestNatural, distanceM: bestDist] : null
 }
 
 Map computeCentroid(List<Map> points) {
@@ -405,48 +474,171 @@ String solarBandColour(double radiation) {
     '#FF6F00'
 }
 
-// Terrain factor (eta): how much harder a surface is to move over than firm pavement,
-// independent of gradient. Grouped from OSM's "surface" tag values.
-double terrainFactorForSurface(String surface) {
-    String s = (surface ?: '').toLowerCase()
-    Set<String> paved = ['asphalt', 'concrete', 'paved', 'paving_stones'] as Set
-    Set<String> compact = ['compacted', 'fine_gravel', 'hard'] as Set
-    Set<String> standardTrail = ['dirt', 'earth', 'ground', 'grass', 'path'] as Set
-    Set<String> roughLoose = ['gravel', 'unpaved', 'stones', 'pebbles', 'rock'] as Set
-    Set<String> severeLoose = ['scree', 'sand', 'boulders'] as Set
+// ----- surface/eta resolution: a five-tier fallback hierarchy -----
+//
+// Each tier is only consulted if every tier above it had nothing to go on, so the more
+// physically-informative tags (an explicit surface reading) always win over cheaper proxies
+// (a highway class with no other information at all). Every tier function returns null when
+// it doesn't apply, so the caller (resolveSurfaceAndEta) can fall through cleanly; whichever
+// one succeeds also reports which tier resolved it, for the console attribution breakdown and
+// the "surface: ..." tooltip/summary-card label - see also speedEtaFromResolvedEta below.
 
-    if (paved.contains(s)) {
-        return 1.0
+// Tier 1: an explicit OSM "surface" tag - the most direct physical measurement available.
+Map tier1FromSurfaceTag(String surface) {
+    String s = (surface ?: '').toLowerCase()
+    if (!s) {
+        return null
     }
-    if (compact.contains(s)) {
-        return 1.1
+    Map<String, List> groups = [
+        paved: [['asphalt', 'concrete', 'paved', 'paving_stones', 'metal'], 1.00],
+        compact: [['compacted', 'fine_gravel'], 1.10],
+        // "path" is a common OSM tagging anti-pattern - the way's highway classification
+        // mistakenly duplicated into surface - treated as equivalent to a dirt/ground trail.
+        trail: [['dirt', 'earth', 'ground', 'grass', 'path'], 1.25],
+        loose: [['gravel', 'unpaved', 'pebbles', 'stones'], 1.45],
+        sand: [['sand'], 1.90],
+        // "boulders" is kept distinct from rock/bare_rock: talus, felsenmeer and blockfields
+        // eliminate a rhythmic walking stride entirely, requiring step-ups, balance checks and
+        // scrambling that degrade forward speed further than a solid rock surface does.
+        rock: [['rock', 'bare_rock'], 1.65],
+        boulders: [['boulders'], 1.85],
+        // Engineered/hard surfaces not covered by the "paved" group above.
+        wood: [['wood'], 1.05],
+        sett: [['sett'], 1.05],
+        cobblestone: [['cobblestone'], 1.15],
+        unhewnCobblestone: [['unhewn_cobblestone'], 1.20],
+        // Organic/loose surfaces.
+        woodchips: [['woodchips'], 1.15],
+        pebblestone: [['pebblestone'], 1.50],
+        mud: [['mud'], 1.65],
+        // Snow and ice.
+        snow: [['snow'], 1.50],
+        ice: [['ice'], 1.85]
+    ]
+    for (entry in groups.values()) {
+        if ((entry[0] as List<String>).contains(s)) {
+            return [surface: s, eta: entry[1] as double]
+        }
     }
-    if (standardTrail.contains(s)) {
-        return 1.25
-    }
-    if (roughLoose.contains(s)) {
-        return 1.5
-    }
-    if (severeLoose.contains(s)) {
-        return 1.9
-    }
-    1.2
+    // A surface tag is present but isn't one of the values calibrated above - still tier 1,
+    // since it's a real reading, just with a moderate placeholder eta pending a specific
+    // mapping.
+    [surface: s, eta: 1.20]
 }
 
-// Speed-model terrain factor: a separate, empirically calibrated surface multiplier used only
-// by the effort-adjusted duration model (see speedSlopeFactor below), not by the trail strain
-// score. RouteCalibrator.groovy measured real hikers' actual pace against a recorded GR92
-// track and found surface roughness costs far less real-world pace than terrainFactorForSurface
-// assumes; that function is left untouched since the strain score's own calibration (a
-// reference 20 km/500 m T1-paved route scored at 50/100) and its "high-strain descent" and
-// mechanical-descent-strain thresholds are tuned against its original 1.0-1.9 scale, not this
-// one. Scree/sand/boulders were not distinctly represented in the one calibration track used so
-// far, so they share the same calibrated value as gravel/rock pending a route that covers them.
-double speedTerrainFactorForSurface(String surface) {
-    String s = (surface ?: '').toLowerCase()
-    Set<String> firm = ['asphalt', 'concrete', 'paved', 'paving_stones', 'compacted', 'fine_gravel', 'hard'] as Set
+// Tier 2: OSM's "tracktype" tag (grade1-grade5), consulted only when surface is missing.
+Map tier2FromTracktype(String tracktype) {
+    Map<String, List> grades = [
+        grade1: ['inferred:grade1_solid', 1.00],
+        grade2: ['inferred:grade2_compact', 1.10],
+        grade3: ['inferred:grade3_mixed', 1.25],
+        grade4: ['inferred:grade4_soft', 1.35],
+        grade5: ['inferred:grade5_loose', 1.60]
+    ]
+    String t = (tracktype ?: '').toLowerCase()
+    if (!grades.containsKey(t)) {
+        return null
+    }
+    List entry = grades[t]
+    [surface: entry[0] as String, eta: entry[1] as double]
+}
 
-    firm.contains(s) ? 1.0 : 1.05
+// Tier 3: OSM's "smoothness" tag, consulted only when surface and tracktype are both missing.
+Map tier3FromSmoothness(String smoothness) {
+    Map<String, List> levels = [
+        excellent: ['inferred:smoothness_good', 1.00], good: ['inferred:smoothness_good', 1.00],
+        intermediate: ['inferred:smoothness_intermediate', 1.15],
+        bad: ['inferred:smoothness_bad', 1.35],
+        very_bad: ['inferred:smoothness_rough', 1.60], horrible: ['inferred:smoothness_rough', 1.60],
+        very_horrible: ['inferred:smoothness_rough', 1.60],
+        impassable: ['inferred:smoothness_impassable', 1.80]
+    ]
+    String s = (smoothness ?: '').toLowerCase()
+    if (!levels.containsKey(s)) {
+        return null
+    }
+    List entry = levels[s]
+    [surface: entry[0] as String, eta: entry[1] as double]
+}
+
+// Tier 4: mapped natural landcover (beach/sand/scree/bare_rock) the point lies inside or near
+// - see landcoverMatchFor. Consulted only once every tag on the matched way is exhausted.
+Map tier4FromNatural(String natural) {
+    String n = (natural ?: '').toLowerCase()
+    if (n in ['sand', 'beach']) {
+        return [surface: 'inferred:beach_sand', eta: 1.90]
+    }
+    if (n in ['scree', 'bare_rock']) {
+        return [surface: 'inferred:rock_scree', eta: 1.70]
+    }
+    null
+}
+
+// Tier 5: the matched way's "highway" class, the last fallback before giving up entirely.
+// "unclassified" is grouped with the paved classes: per Spanish OSM tagging conventions and
+// major routing profiles (OSRM, BRouter), it denotes a paved rural public through-road, not a
+// generic unpaved track - a genuinely unpaved rural way is tagged highway=track, which is
+// already caught earlier by tier 2 (tracktype).
+Map tier5FromHighway(String highway) {
+    String h = (highway ?: '').toLowerCase()
+    Set<String> pavedHighways = ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'unclassified', 'residential', 'living_street', 'pedestrian', 'service'] as Set
+    Set<String> pathHighways = ['path', 'footway', 'steps'] as Set
+    if (pavedHighways.contains(h)) {
+        return [surface: 'inferred:highway_paved', eta: 1.00]
+    }
+    if (h == 'cycleway') {
+        return [surface: 'inferred:cycleway', eta: 1.05]
+    }
+    if (h == 'track') {
+        return [surface: 'inferred:track_unspecified', eta: 1.20]
+    }
+    if (pathHighways.contains(h)) {
+        return [surface: 'inferred:path_unspecified', eta: 1.25]
+    }
+    null
+}
+
+// Runs the full five-tier chain for one point, returning the resolved surface label, its eta,
+// and which tier resolved it (for the console attribution breakdown). "unknown" only happens
+// when nothing - not even a highway class - matched anything at all.
+Map resolveSurfaceAndEta(double plat, double plon, Map tags, List<Map> landcoverFeatures, double landcoverThresholdM) {
+    Map t1 = tier1FromSurfaceTag(tags.surface as String)
+    if (t1) {
+        return t1 + [tier: 'surface']
+    }
+    Map t2 = tier2FromTracktype(tags.tracktype as String)
+    if (t2) {
+        return t2 + [tier: 'tracktype']
+    }
+    Map t3 = tier3FromSmoothness(tags.smoothness as String)
+    if (t3) {
+        return t3 + [tier: 'smoothness']
+    }
+    Map landcoverMatch = landcoverMatchFor(plat, plon, landcoverFeatures, landcoverThresholdM)
+    if (landcoverMatch) {
+        Map t4 = tier4FromNatural(landcoverMatch.natural as String)
+        if (t4) {
+            return t4 + [tier: 'landcover']
+        }
+    }
+    Map t5 = tier5FromHighway(tags.highway as String)
+    if (t5) {
+        return t5 + [tier: 'highway']
+    }
+    [surface: 'unknown', eta: 1.20, tier: 'unknown']
+}
+
+// Speed-model terrain factor: a separate, empirically calibrated multiplier used only by the
+// effort-adjusted duration model (see slopeSpeedFactor below), not by the trail strain score.
+// RouteCalibrator.groovy measured real hikers' actual pace against a recorded GR92 track and
+// found surface roughness costs far less real-world pace than the strain model's eta assumes;
+// that scale is left untouched above since the strain score's own calibration (a reference
+// 20 km/500 m T1-paved route scored at 50/100) and its "high-strain descent" and mechanical-
+// descent-strain thresholds are tuned against it, not this one. Firm ground (eta <= 1.10 -
+// paved, compacted, and their tier 2/3/5 equivalents) is the only category the calibration
+// distinguished from everything else.
+double speedEtaFromResolvedEta(double resolvedEta) {
+    resolvedEta <= 1.10 ? 1.00 : 1.05
 }
 
 // Technical penalty (T-factor): the extra care/exposure/scrambling load implied by the
@@ -783,7 +975,7 @@ String formatDuration(double hours) {
     String.format(Locale.ROOT, '%dh %02dmin', h, m)
 }
 
-void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult, Map dynamicResult) {
+void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult, Map dynamicResult, Map surfaceAttribution) {
     println '=== Elevation profile summary ==='
     println String.format(Locale.ROOT, 'Total distance : %.2f km', distanceKm)
     println String.format(Locale.ROOT, 'Total ascent   : %.0f m', ascent)
@@ -815,6 +1007,12 @@ void printSummary(double distanceKm, double ascent, double descent, double durat
     println String.format(Locale.ROOT, 'Recommended total carry        : %.1f L (vs flat static estimate %.1f L)', dynamicResult.dynamicCarry as double, dynamicResult.staticCarry as double)
     println "Reason                         : ${dynamicResult.reason}"
     println "Trail data      : ${trailInfo.matched ? 'Matched to OpenStreetMap (surface/SAC scale available)' : 'Raw GPX (no OSM match; surface/SAC scale unknown)'}"
+    println 'Surface resolution      :'
+    println String.format(Locale.ROOT, '  - Explicit surface tag           : %.1f%%', surfaceAttribution.surfaceTagPct as double)
+    println String.format(Locale.ROOT, '  - Inferred from tracktype        : %.1f%%', surfaceAttribution.tracktypePct as double)
+    println String.format(Locale.ROOT, '  - Inferred from smoothness       : %.1f%%', surfaceAttribution.smoothnessPct as double)
+    println String.format(Locale.ROOT, '  - Inferred from landcover/highway: %.1f%%', surfaceAttribution.landcoverHighwayPct as double)
+    println String.format(Locale.ROOT, '  - Unmatched/unknown              : %.1f%%', surfaceAttribution.unknownPct as double)
     println "Difficulty      : ${difficultyResult.tier}"
     println "Reason          : ${difficultyResult.reason}"
     println String.format(Locale.ROOT, 'Effort (Shenandoah): %.0f (%s)', shenandoahResult.score as double, shenandoahResult.tier)
@@ -1367,12 +1565,12 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             <table>
                 <tr><th>Metric</th><th>This route</th></tr>
                 <tr><td>Total steep descent (&lt; -15%)</td><td>${String.format(Locale.ROOT, '%.2f km', steepDescentKm)}</td></tr>
-                <tr><td>&nbsp;&nbsp;- Smooth (paved/asphalt)</td><td>${String.format(Locale.ROOT, '%.2f km', smoothSteepDescentKm)}</td></tr>
-                <tr><td>&nbsp;&nbsp;- Rough (trail/unknown)</td><td>${String.format(Locale.ROOT, '%.2f km', roughSteepDescentKm)}</td></tr>
+                <tr><td>&nbsp;&nbsp;- Smooth (firm ground, eta &le; 1.10)</td><td>${String.format(Locale.ROOT, '%.2f km', smoothSteepDescentKm)}</td></tr>
+                <tr><td>&nbsp;&nbsp;- Rough (everything else)</td><td>${String.format(Locale.ROOT, '%.2f km', roughSteepDescentKm)}</td></tr>
             </table>
             <p style="font-size: 12px; color: #666;">
                 ${trailMatched
-                    ? 'Surface type comes from the nearest OpenStreetMap way within 30 m, fetched via the Overpass API.'
+                    ? 'Surface comes from a five-tier fallback (explicit surface tag, then tracktype, smoothness, nearby natural landcover, and finally highway class) resolved from the nearest OpenStreetMap way within 30 m, fetched via the Overpass API.'
                     : 'No OpenStreetMap match is available for this route, so surface type could not be determined and every steep descent is counted as "rough" by default.'}
             </p>
             <button onclick="hideDescentInfo()">Close</button>
@@ -1382,6 +1580,15 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         <div class="modal-box" onclick="event.stopPropagation()">
             <h2>Trail strain score</h2>
             <p>${escapeXml(trailStrainReason)}</p>
+            <p style="font-size: 12px; color: #666;">
+                As a rough guide: ~50 is about as strenuous as a standard 20 km hike with 500 m
+                of climbing and descending on flat, paved ground - that's the reference point
+                the score is scaled against. Below 50, this route asks less of your legs than
+                that reference day out; into the 60s-70s means real climbing and/or rougher
+                footing; 80+ means sustained steep, technical or high-friction terrain. 100 is
+                the model's practical ceiling (scores are capped there), not a claim that no
+                route can be harder than that.
+            </p>
             <table>
                 <tr><th>Metric</th><th>This route</th></tr>
                 <tr><td>Effort distance</td><td>${String.format(Locale.ROOT, '%.2f km', effortDistanceKm)}</td></tr>
@@ -1790,6 +1997,10 @@ if (!options.noCache && cacheFile.exists()) {
     matchSource = 'cache'
     println "Loaded OpenStreetMap data from local cache: maps/${cacheFile.name}"
 } else {
+    // The public Overpass instance can take anywhere from a couple of seconds to the full
+    // request timeout below to respond, especially under load - print this up front so a slow
+    // response reads as "working" rather than "hung", since nothing else prints in between.
+    println 'Querying OpenStreetMap via the Overpass API (this can take up to a minute if the shared public instance is busy)...'
     try {
         Map bbox = computeBoundingBox(points)
         String rawJson = fetchOverpassRaw(bbox)
@@ -1803,8 +2014,10 @@ if (!options.noCache && cacheFile.exists()) {
 }
 
 List<Map> osmWays = parseOsmWays(osmData)
+List<Map> landcoverFeatures = parseLandcoverFeatures(osmData)
 Map trailInfo = [matched: !osmWays.isEmpty(), source: matchSource]
 double surfaceSnapThresholdM = 30.0
+double landcoverThresholdM = 15.0
 
 String weatherCacheBaseName = options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '')
 // Only historic (Archive API) data is ever cached to disk: a past date's weather is fixed
@@ -1866,22 +2079,40 @@ for (int i = 1; i < points.size(); i++) {
     points[i].distance = cumulative
 }
 
+Map<String, Integer> surfaceTierCounts = [:].withDefault { 0 }
 for (int i = 0; i < points.size(); i++) {
-    Map wayInfo = nearestWayInfo(points[i].lat as double, points[i].lon as double, osmWays, surfaceSnapThresholdM)
-    points[i].surface = wayInfo.surface
-    points[i].sacScale = wayInfo.sacScale
-    points[i].tracktype = wayInfo.tracktype
-    points[i].highway = wayInfo.highway
-    points[i].tunnel = wayInfo.tunnel
-    points[i].covered = wayInfo.covered
-    points[i].natural = wayInfo.natural
-    points[i].landuse = wayInfo.landuse
-    points[i].eta = terrainFactorForSurface(wayInfo.surface as String)
-    points[i].speedEta = speedTerrainFactorForSurface(wayInfo.surface as String)
-    points[i].tFactor = technicalFactorForSacScale(wayInfo.sacScale as String)
+    double plat = points[i].lat as double
+    double plon = points[i].lon as double
+    Map wayInfo = nearestWayInfo(plat, plon, osmWays, surfaceSnapThresholdM)
+    Map tags = wayInfo.tags as Map
+    Map resolved = resolveSurfaceAndEta(plat, plon, tags, landcoverFeatures, landcoverThresholdM)
+
+    points[i].surface = resolved.surface
+    points[i].surfaceTier = resolved.tier
+    points[i].sacScale = (tags.sac_scale ?: 'none') as String
+    points[i].tracktype = (tags.tracktype ?: 'unknown') as String
+    points[i].highway = (tags.highway ?: 'unknown') as String
+    points[i].tunnel = (tags.tunnel ?: '') as String
+    points[i].covered = (tags.covered ?: '') as String
+    points[i].natural = (tags.natural ?: '') as String
+    points[i].landuse = (tags.landuse ?: '') as String
+    points[i].eta = resolved.eta as double
+    points[i].speedEta = speedEtaFromResolvedEta(resolved.eta as double)
+    points[i].tFactor = technicalFactorForSacScale(points[i].sacScale as String)
+
+    surfaceTierCounts[resolved.tier as String] = (surfaceTierCounts[resolved.tier as String] ?: 0) + 1
 }
 
-Set<String> smoothSurfaces = ['paved', 'asphalt'] as Set
+// Attribution breakdown for the console diagnostic: what fraction of the route's surface/eta
+// values came from an explicit tag versus each successively weaker fallback.
+double pointCount = points.size() as double
+Map surfaceAttribution = [
+    surfaceTagPct: (surfaceTierCounts['surface'] ?: 0) / pointCount * 100.0,
+    tracktypePct: (surfaceTierCounts['tracktype'] ?: 0) / pointCount * 100.0,
+    smoothnessPct: (surfaceTierCounts['smoothness'] ?: 0) / pointCount * 100.0,
+    landcoverHighwayPct: ((surfaceTierCounts['landcover'] ?: 0) + (surfaceTierCounts['highway'] ?: 0)) / pointCount * 100.0,
+    unknownPct: (surfaceTierCounts['unknown'] ?: 0) / pointCount * 100.0
+]
 
 double totalAscent = 0.0
 double totalDescent = 0.0
@@ -1956,11 +2187,15 @@ for (int i = 1; i < points.size(); i++) {
 
     // Mechanical descent strain: a steep, rough (unpaved/unknown surface) descent loads
     // the quads and knees eccentrically far more than the same gradient on a paved path.
+    // "Smooth" here means firm ground (eta <= 1.10 - paved, compacted, and their tier
+    // 2/3/5 equivalents), matching the same threshold speedEtaFromResolvedEta uses, rather
+    // than a separate hardcoded surface-name list that the new inferred labels wouldn't match.
     double segDist = (points[i].distance as double) - (points[i - 1].distance as double)
     String surface = (points[i].surface ?: 'unknown') as String
+    double eta = points[i].eta as double
     if (grade < -15.0) {
         steepDescentDistanceM += segDist
-        if (smoothSurfaces.contains(surface.toLowerCase())) {
+        if (eta <= 1.10) {
             smoothSteepDescentDistanceM += segDist
         } else {
             roughSteepDescentDistanceM += segDist
@@ -1972,7 +2207,6 @@ for (int i = 1; i < points.size(); i++) {
     // strain, each scaled by the terrain factor (eta) and technical factor (T-factor) at
     // this point. Grade is stored as a percentage elsewhere, so it is converted to a
     // fraction here to match the model's expected units.
-    double eta = points[i].eta as double
     double tFactor = points[i].tFactor as double
     double gradeFraction = grade / 100.0
 
@@ -1997,7 +2231,7 @@ for (int i = 1; i < points.size(); i++) {
     // Effort-adjusted duration: integrate a per-segment speed (the calibrated slope-response
     // curve, scaled by the calibrated speed-model terrain factor and the shared technical
     // factor) rather than DIN 33466's fixed rates. Uses speedEta, not the strain model's eta -
-    // see speedTerrainFactorForSurface's comment for why the two are kept separate.
+    // see speedEtaFromResolvedEta's comment for why the two are kept separate.
     double speedEta = points[i].speedEta as double
     double slopeFactor = slopeSpeedFactor(gradeFraction)
     double vSegEffort = options.speedKmh * slopeFactor / (speedEta * tFactor)
@@ -2092,7 +2326,7 @@ Map dynamicResult = dynamicWeatherSummary(
     totalDynamicWaterLitres, totalBreakWaterLitres, waterResult.recommendedCarry as double, weatherMatched
 )
 
-printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult)
+printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult, surfaceAttribution)
 
 File output = options.outputPath ? new File(options.outputPath) : new File(options.gpxFile.absoluteFile.parentFile, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '-profile.html')
 output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult, breakEvents)

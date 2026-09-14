@@ -235,14 +235,17 @@ The temperature/exposure slider (Water tile) and the base-speed slider
 
 ## Trail surface via OpenStreetMap
 
-The tool fetches every navigable `highway` way in the route's bounding box
-(padded by 0.005° / ~500 m on each side) from the public
+The tool fetches every navigable `highway` way, plus high-friction natural
+landcover features (`natural` = beach/sand/scree/bare_rock), in the route's
+bounding box (padded by 0.005° / ~500 m on each side) from the public
 [Overpass API](https://wiki.openstreetmap.org/wiki/Overpass_API) — no API
 key required — and geometrically snaps each GPX point to the nearest way to
-read its `surface`, `sac_scale`, `tracktype` and `highway` tags. This lets
-the tool know, for example, that a descent is on loose gravel rather than
-pavement.
+read its `surface`, `sac_scale`, `tracktype`, `smoothness` and `highway`
+tags. This lets the tool know, for example, that a descent is on loose
+gravel rather than pavement.
 
+- **Query**: a single request fetches both feature types in one union:
+  `way["highway"](bbox); wr["natural"~"^(beach|sand|scree|bare_rock)$"](bbox);`.
 - **Caching**: the raw Overpass response is saved as
   `maps/<gpxBaseName>.osm.json` (created next to the input file). On the
   next run, if that file exists it is loaded directly and the API is not
@@ -252,19 +255,53 @@ pavement.
 - **Snapping**: for each GPX point, every candidate way segment within its
   bounding box is checked using a local planar projection (accurate at this
   scale, and far cheaper than repeated great-circle math) to find the
-  closest point-to-segment distance. If the nearest segment is within 30 m,
-  its tags are used; if the `surface` tag itself is missing but `highway` is
-  a standard paved class (residential, primary, secondary, ...), `surface`
-  is inferred as `"paved"`. If `highway` is instead a class that's almost
-  always unpaved in practice (track, path, footway, bridleway, steps),
-  `surface` is inferred as `"ground"` rather than left unknown — OSM
-  mappers frequently tag a rural trail's existence without ever adding a
-  `surface` tag, and some GR92 stages have plenty of this gap; see
-  `TODO.md` for improving on this heuristic with a secondary data source.
-- **No match, or the request fails**: if nothing is found within 30 m, or
-  Overpass is unreachable/times out/rate-limits and no cache exists, the
-  tool warns and falls back to `surface: "unknown"`, `sac_scale: "none"` for
-  every point — the run always completes.
+  closest point-to-segment distance. If the nearest way is within 30 m, its
+  tags feed the five-tier surface/friction (eta) resolution below.
+- **Five-tier surface/eta resolution**: each tier is only consulted if
+  every tier above it had nothing to go on, so a real physical measurement
+  always wins over a cheaper proxy:
+  1. **Explicit `surface` tag** — asphalt/concrete/paved/paving_stones/metal
+     (eta 1.00), compacted/fine_gravel (1.10), dirt/earth/ground/grass/path
+     (1.25, `path` here being a common OSM tagging anti-pattern where the
+     highway classification gets mistakenly duplicated into `surface`),
+     gravel/unpaved/pebbles/stones (1.45), sand (1.90), rock/bare_rock
+     (1.65). Also several less common but real values: wood/sett (1.05,
+     boardwalks and dressed stone pavers), cobblestone (1.15),
+     woodchips (1.15), unhewn_cobblestone (1.20), pebblestone (1.50),
+     snow (1.50), mud/boulders/ice (1.65/1.85/1.85 — boulders is kept
+     distinct from rock/bare_rock, since talus/felsenmeer/blockfields
+     eliminate a rhythmic walking stride entirely rather than just being
+     firm-but-uneven). A present-but-still-unrecognised value falls back
+     to a moderate placeholder eta of 1.20.
+  2. **`tracktype`** (grade1–grade5, only if `surface` is missing) — maps
+     to `"inferred:grade1_solid"` (eta 1.00) through
+     `"inferred:grade5_loose"` (1.60).
+  3. **`smoothness`** (only if `surface` and `tracktype` are both missing)
+     — `"inferred:smoothness_good"` (1.00) through
+     `"inferred:smoothness_impassable"` (1.80).
+  4. **Nearby natural landcover** (only if none of the above are present)
+     — a point inside, or within 15 m of, a mapped beach/sand polygon
+     resolves to `"inferred:beach_sand"` (1.90); scree/bare_rock resolves
+     to `"inferred:rock_scree"` (1.70). Point-in-polygon is checked for
+     closed ways; everything else falls back to distance-to-edge.
+  5. **`highway` class** — the last fallback, once every other tag and
+     landcover check has failed. Paved-class highways (residential,
+     primary, secondary, unclassified, ...) resolve to
+     `"inferred:highway_paved"` (1.00) — `unclassified` is grouped here
+     since, per Spanish OSM tagging conventions and major routing
+     profiles, it denotes a paved rural through-road, not a generic
+     unpaved track (a genuinely unpaved way is tagged `track`, already
+     caught by tier 2); `cycleway` resolves to 1.05; `track` to
+     `"inferred:track_unspecified"` (1.20); `path`/`footway`/`steps` to
+     `"inferred:path_unspecified"` (1.25). Nothing matching anything at
+     all falls back to plain `"unknown"` (1.20) — the run always
+     completes regardless.
+- **Attribution**: the console summary reports what percentage of the
+  route's points were resolved by each tier (explicit tag / tracktype /
+  smoothness / landcover-or-highway / unmatched), so you can see at a
+  glance how much of a route's surface data is measured versus inferred.
+  See `TODO.md` for further work on a secondary data source to shrink the
+  inferred share.
 
 ## Dynamic weather & solar exposure
 
@@ -360,10 +397,11 @@ A steep, loose-surfaced descent loads the quads and knees eccentrically
 "Steep descent" tile sums the distance of every descent steeper than -15%,
 split by surface:
 
-- **Smooth**: paved or asphalt.
-- **Rough**: gravel, ground, path, unpaved, or unknown (i.e. anything that
-  isn't a hard, even surface) — everything is counted as rough when no OSM
-  match is available.
+- **Smooth**: firm ground, i.e. a resolved terrain factor (eta) of 1.10 or
+  below — paved/compacted surfaces and their tracktype/smoothness/highway
+  equivalents (see "Trail surface via OpenStreetMap" above).
+- **Rough**: everything else, eta above 1.10 — including unknown, when no
+  OSM match is available at all.
 
 ## Trail strain model
 
@@ -372,10 +410,11 @@ difficulty with gradient into a single 0-100 score, separating *metabolic*
 cost (how tiring) from *biomechanical* cost (how jarring):
 
 - **Terrain factor (eta)**: how much harder a surface is to move over than
-  firm pavement — 1.0 for paved/asphalt/concrete, 1.1 for compacted/fine
-  gravel, 1.25 for dirt/earth/ground/grass/path, 1.5 for gravel/unpaved/
-  stones/rock, 1.9 for scree/sand/boulders, 1.2 as a fallback for anything
-  unrecognised.
+  firm pavement, resolved through the five-tier fallback hierarchy
+  described under "Trail surface via OpenStreetMap" above (explicit
+  `surface` tag, then `tracktype`, then `smoothness`, then nearby natural
+  landcover, then `highway` class) — ranging from 1.00 for paved ground up
+  to 1.90 for sand/beach.
 - **Technical factor**: from the OSM `sac_scale` tag — 1.0 for
   hiking/T1/none, 1.15 for mountain_hiking/T2, 1.35 for
   demanding_mountain_hiking/T3, 1.6 for alpine_hiking/T4 and above.
