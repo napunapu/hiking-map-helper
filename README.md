@@ -255,7 +255,12 @@ pavement.
   closest point-to-segment distance. If the nearest segment is within 30 m,
   its tags are used; if the `surface` tag itself is missing but `highway` is
   a standard paved class (residential, primary, secondary, ...), `surface`
-  is inferred as `"paved"`.
+  is inferred as `"paved"`. If `highway` is instead a class that's almost
+  always unpaved in practice (track, path, footway, bridleway, steps),
+  `surface` is inferred as `"ground"` rather than left unknown — OSM
+  mappers frequently tag a rural trail's existence without ever adding a
+  `surface` tag, and some GR92 stages have plenty of this gap; see
+  `TODO.md` for improving on this heuristic with a secondary data source.
 - **No match, or the request fails**: if nothing is found within 30 m, or
   Overpass is unreachable/times out/rate-limits and no cache exists, the
   tool warns and falls back to `surface: "unknown"`, `sac_scale: "none"` for

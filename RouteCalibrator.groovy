@@ -119,9 +119,18 @@ double technicalFactorForSacScale(String sacScale) {
     1.0
 }
 
+// Mirrors ElevationProfiler.groovy's inferSurfaceFromHighway, including its unpaved-trail
+// fallback (track/path/footway/... default to 'ground' rather than 'unknown') - see TODO.md.
 String inferSurfaceFromHighway(String highway) {
     Set<String> paved = ['residential', 'primary', 'secondary', 'tertiary', 'unclassified', 'living_street', 'service', 'trunk', 'motorway'] as Set
-    (highway && paved.contains(highway)) ? 'paved' : 'unknown'
+    Set<String> unpavedTrail = ['track', 'path', 'footway', 'bridleway', 'steps'] as Set
+    if (highway && paved.contains(highway)) {
+        return 'paved'
+    }
+    if (highway && unpavedTrail.contains(highway)) {
+        return 'ground'
+    }
+    'unknown'
 }
 
 double pointToSegmentDistanceM(double plat, double plon, double alat, double alon, double blat, double blon) {

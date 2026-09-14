@@ -134,9 +134,21 @@ List<Map> parseOsmWays(Map osmData) {
     }
 }
 
+// OSM mappers very often record a rural trail's existence (track/path/footway/...) without
+// ever adding a surface tag - defaulting that gap to "unknown" (the model's lowest, most
+// generic terrain penalty) systematically understates difficulty on routes with sparse
+// tagging, which some GR92 stages have plenty of. 'ground' is a reasonable unpaved-trail
+// default until a secondary data source can confirm the actual surface - see TODO.md.
 String inferSurfaceFromHighway(String highway) {
     Set<String> paved = ['residential', 'primary', 'secondary', 'tertiary', 'unclassified', 'living_street', 'service', 'trunk', 'motorway'] as Set
-    (highway && paved.contains(highway)) ? 'paved' : 'unknown'
+    Set<String> unpavedTrail = ['track', 'path', 'footway', 'bridleway', 'steps'] as Set
+    if (highway && paved.contains(highway)) {
+        return 'paved'
+    }
+    if (highway && unpavedTrail.contains(highway)) {
+        return 'ground'
+    }
+    'unknown'
 }
 
 // A local equirectangular projection is accurate enough at the scale of a 30 m matching
