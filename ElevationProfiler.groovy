@@ -1807,41 +1807,46 @@ Map trailInfo = [matched: !osmWays.isEmpty(), source: matchSource]
 double surfaceSnapThresholdM = 30.0
 
 String weatherCacheBaseName = options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '')
-// Historic (Archive API) dates each get their own permanent cache file, since every
-// distinct past date is a genuinely different, independently reusable dataset - unlike
-// the Forecast API's single rolling window, which stays valid for any nearby date and so
-// only needs one shared file. Without this, querying a second past date would overwrite
-// the first date's cache, forcing a re-fetch if you ever went back to it.
-File weatherCacheFile = isPastDate
-    ? new File(mapsDir, "${weatherCacheBaseName}.weather.${startLocalDate}.json")
-    : new File(mapsDir, "${weatherCacheBaseName}.weather.json")
+// Only historic (Archive API) data is ever cached to disk: a past date's weather is fixed
+// and permanently reusable, one file per date since each is a genuinely different, independent
+// dataset - without that, querying a second past date would overwrite the first date's cache,
+// forcing a re-fetch if you ever went back to it. The Forecast API is deliberately never
+// cached, since a forecast is provisional and can change between two runs on the same day
+// (or as the target date gets closer) - caching it risks silently acting on a stale forecast.
+File weatherCacheFile = new File(mapsDir, "${weatherCacheBaseName}.weather.${startLocalDate}.json")
 Map weatherData = null
 
 if (!dateSupported) {
     // Already warned above; no point querying (or trusting a stale cache against) a date
     // Open-Meteo can't actually cover.
-} else {
+} else if (isPastDate) {
     Map cachedData = (!options.noCache && weatherCacheFile.exists()) ? new JsonSlurper().parse(weatherCacheFile) as Map : null
     Map cachedTimeline = cachedData ? parseWeatherTimeline(cachedData) : null
 
     // Belt-and-braces: the per-date filename already keeps historic caches from colliding,
-    // and the Forecast API's cache is a rolling 16-day window valid for any nearby --date,
-    // but only trust either cache if it actually covers the currently requested date.
+    // but only trust it if it actually covers the currently requested date.
     if (cachedTimeline && timelineCoversDate(cachedTimeline, startLocalDate)) {
         weatherData = cachedData
         println "Loaded weather data from local cache: maps/${weatherCacheFile.name}"
     } else {
         try {
             Map centroid = computeCentroid(points)
-            String rawJson = isPastDate
-                ? fetchWeatherArchiveRaw(centroid.lat as double, centroid.lon as double, startLocalDate)
-                : fetchWeatherForecastRaw(centroid.lat as double, centroid.lon as double)
+            String rawJson = fetchWeatherArchiveRaw(centroid.lat as double, centroid.lon as double, startLocalDate)
             weatherCacheFile.text = rawJson
             weatherData = new JsonSlurper().parseText(rawJson) as Map
-            println "Fetched and cached weather data from Open-Meteo (${isPastDate ? 'Archive' : 'Forecast'} API)"
+            println 'Fetched and cached weather data from Open-Meteo (Archive API)'
         } catch (Exception ex) {
             System.err.println("Open-Meteo request failed (${ex.message}); using static -t/--temp value with no solar radiation model.")
         }
+    }
+} else {
+    try {
+        Map centroid = computeCentroid(points)
+        String rawJson = fetchWeatherForecastRaw(centroid.lat as double, centroid.lon as double)
+        weatherData = new JsonSlurper().parseText(rawJson) as Map
+        println 'Fetched live weather data from Open-Meteo (Forecast API, not cached)'
+    } catch (Exception ex) {
+        System.err.println("Open-Meteo request failed (${ex.message}); using static -t/--temp value with no solar radiation model.")
     }
 }
 

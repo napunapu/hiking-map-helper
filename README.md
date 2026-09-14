@@ -282,20 +282,17 @@ whole hike.
   instead, for that single day. Both return the same `hourly.time` /
   `temperature_2m` / `direct_radiation` / `cloud_cover` shape, so the rest
   of the simulation doesn't need to know which one answered.
-- **Caching**: the Forecast API's response is saved as
-  `maps/<gpxBaseName>.weather.json` — one shared file, since its 16-day
-  window covers any nearby `--date` without refetching. Each Archive
-  (historic) date instead gets its own permanent file,
-  `maps/<gpxBaseName>.weather.<yyyy-MM-dd>.json`, since every past date is
-  an independent dataset — fetching one historic date doesn't evict
-  another you looked up earlier; each stays cached and is reused if you
-  come back to it. Either way, a cache is only trusted if it actually
-  covers the currently requested `--date`, and `--no-cache` forces a fresh
-  request regardless. A forecast is still just a snapshot from whenever it
-  was fetched — for a forecast several days out, re-fetch closer to the
-  day (`--no-cache`) for accuracy. If the request fails and no cache
-  exists, the tool falls back to a flat `-t`/`--temp` value with no solar
-  radiation model, and says so.
+- **Caching**: only the Archive API is cached, since a past date's weather
+  is fixed and permanently reusable. Each historic date gets its own file,
+  `maps/<gpxBaseName>.weather.<yyyy-MM-dd>.json` — fetching one historic
+  date doesn't evict another you looked up earlier; each stays cached and
+  is reused if you come back to it (only if it actually covers the
+  requested `--date`), and `--no-cache` forces a fresh request regardless.
+  The Forecast API is **never** cached — a forecast is provisional and can
+  change between two runs on the same day, or as the target date gets
+  closer, so every run against a today-or-future `--date` fetches live.
+  If the request fails and no cache exists, the tool falls back to a flat
+  `-t`/`--temp` value with no solar radiation model, and says so.
 - **Date range**: `--date` can be any past date or up to 16 days in the
   future. Dates further in the future than that aren't forecast yet, which
   disables the weather/solar simulation for that run with a clear warning,
