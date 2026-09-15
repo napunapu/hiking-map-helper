@@ -629,11 +629,11 @@ Map resolveSurfaceAndEta(double plat, double plon, Map tags, List<Map> landcover
 }
 
 // Speed-model terrain factor: a separate, empirically calibrated multiplier used only by the
-// effort-adjusted duration model (see slopeSpeedFactor below), not by the trail strain score.
-// RouteCalibrator.groovy measured real hikers' actual pace against a recorded GR92 track and
-// found surface roughness costs far less real-world pace than the strain model's eta assumes;
-// that scale is left untouched above since the strain score's own calibration (a reference
-// 20 km/500 m T1-paved route scored at 50/100) and its "high-strain descent" and mechanical-
+// effort-adjusted duration model (see slopeSpeedFactor below), not by the Flat Equivalent
+// Distance model (flat cardio/downhill impact km). RouteCalibrator.groovy measured real
+// hikers' actual pace against a recorded GR92 track and found surface roughness costs far
+// less real-world pace than the flat-equivalent model's eta assumes; that scale is left
+// untouched above since the flat-equivalent model's high-strain-descent and mechanical-
 // descent-strain thresholds are tuned against it, not this one. Firm ground (eta <= 1.10 -
 // paved, compacted, and their tier 2/3/5 equivalents) is the only category the calibration
 // distinguished from everything else.
@@ -682,20 +682,6 @@ String strainColour(double intensity) {
         return '#FB8C00'
     }
     '#B71C1C'
-}
-
-// A 0-100 index scaled against a hypothetical reference route: 20 km with 500 m of gentle
-// climbing then 500 m of gentle descending (+/-5% grade, well below the -10% braking
-// threshold), entirely on T1/paved terrain. That reference route is defined to land at 50
-// on the scale, so routes roughly twice as metabolically/mechanically costly land near 100.
-double compositeStrainScore(double effortDistanceKm, double totalBrakingIndex) {
-    double refHalfDistanceM = 10000.0
-    double refEffortDistanceKm = refHalfDistanceM * (minettiCostMultiplier(0.05) + minettiCostMultiplier(-0.05)) / 1000.0
-    double refCombined = refEffortDistanceKm
-
-    double actualCombined = effortDistanceKm + (totalBrakingIndex / 1000.0)
-    double score = refCombined > 0 ? (actualCombined / refCombined) * 50.0 : 0.0
-    Math.max(0.0, Math.min(100.0, score))
 }
 
 List<Double> movingAverage(List<Double> values, int windowSize) {
@@ -935,8 +921,17 @@ Map waterIntakeRecommendation(double durationHours, double tempCelsius, double e
     ]
 }
 
-Map trailStrainSummary(double effortDistanceKm, double actualDistanceKm, double totalBrakingIndex, double highStrainDescentKm, Map<String, Double> surfaceDistanceM, double totalDistanceM) {
-    double score = compositeStrainScore(effortDistanceKm, totalBrakingIndex)
+// Flat Equivalent Distance model: expresses metabolic and mechanical load as km of flat,
+// paved walking - a HealthFit/Strava-style grade-adjusted-pace figure - rather than an
+// abstract 0-100 score with no physical meaning of its own.
+Map trailStrainSummary(double flatCardioKm, double actualDistanceKm, double brakingIndexRaw, double highStrainDescentKm, Map<String, Double> surfaceDistanceM, double totalDistanceM) {
+    // The raw braking index accumulates in metres (distance_m * (|grade| / 0.10)^2 * eta *
+    // T-factor per segment), so dividing by 1000 expresses it as km, on the same footing as
+    // flatCardioKm.
+    double downhillImpactKm = brakingIndexRaw / 1000.0
+    double totalEffortKm = flatCardioKm + downhillImpactKm
+    double effortMultiplier = actualDistanceKm > 0 ? totalEffortKm / actualDistanceKm : 1.0
+    double aerobicDemandPct = actualDistanceKm > 0 ? ((flatCardioKm / actualDistanceKm) - 1.0) * 100.0 : 0.0
 
     List<Map> surfaceBreakdown = totalDistanceM > 0
         ? surfaceDistanceM.collect { surface, distM -> [surface: surface, pct: (distM / totalDistanceM) * 100.0] }.sort { -it.pct }
@@ -944,17 +939,20 @@ Map trailStrainSummary(double effortDistanceKm, double actualDistanceKm, double 
 
     String reason = String.format(
         Locale.ROOT,
-        'Composite strain score is %.0f/100, scaled against a reference 20 km / 500 m T1 route on paved ' +
-        'ground. This route\'s effort distance is %.2f km (metabolic cost, equivalent flat paved km) versus ' +
-        '%.2f km actual, with a braking load index of %.0f from %.2f km of high-strain technical descent ' +
-        '(steeper than -15%% on rough or loose surface).',
-        score, effortDistanceKm, actualDistanceKm, totalBrakingIndex, highStrainDescentKm
+        'Flat cardio equivalent is %.1f km - the aerobic/caloric cost of this %.1f km route if it were ' +
+        'entirely flat pavement (+%.0f%% over the actual distance), similar to a grade-adjusted pace. ' +
+        'Downhill impact surcharge adds a further %.1f km, the mechanical quad/knee braking load from ' +
+        'descents steeper than -10%%, weighted by surface roughness (%.1f km of that is on rough or loose ' +
+        'ground steeper than -15%%, the most jarring combination). Combined, the total flat equivalent is ' +
+        '%.1f km (%.2fx actual distance) - a practical planning figure for pacing, nutrition and recovery.',
+        flatCardioKm, actualDistanceKm, aerobicDemandPct, downhillImpactKm, highStrainDescentKm,
+        totalEffortKm, effortMultiplier
     )
 
     [
-        score: score, effortDistanceKm: effortDistanceKm, actualDistanceKm: actualDistanceKm,
-        totalBrakingIndex: totalBrakingIndex, highStrainDescentKm: highStrainDescentKm,
-        surfaceBreakdown: surfaceBreakdown, reason: reason
+        flatCardioKm: flatCardioKm, actualDistanceKm: actualDistanceKm, downhillImpactKm: downhillImpactKm,
+        totalEffortKm: totalEffortKm, effortMultiplier: effortMultiplier, aerobicDemandPct: aerobicDemandPct,
+        highStrainDescentKm: highStrainDescentKm, surfaceBreakdown: surfaceBreakdown, reason: reason
     ]
 }
 
@@ -1025,10 +1023,16 @@ void printSummary(double distanceKm, double ascent, double descent, double durat
     println String.format(Locale.ROOT, 'Steep descent (< -15%%): %.2f km', (descentStrain.steepDescentDistanceM as double) / 1000.0)
     println String.format(Locale.ROOT, '  - Smooth (paved)     : %.2f km', (descentStrain.smoothSteepDescentDistanceM as double) / 1000.0)
     println String.format(Locale.ROOT, '  - Rough (trail)      : %.2f km', (descentStrain.roughSteepDescentDistanceM as double) / 1000.0)
-    println String.format(Locale.ROOT, 'Effort distance      : %.2f km (actual: %.2f km)', trailStrain.effortDistanceKm as double, trailStrain.actualDistanceKm as double)
-    println String.format(Locale.ROOT, 'Braking load index   : %.0f', trailStrain.totalBrakingIndex as double)
-    println String.format(Locale.ROOT, 'High-strain descent  : %.2f km (< -15%% grade on rough/loose surface)', trailStrain.highStrainDescentKm as double)
-    println String.format(Locale.ROOT, 'Trail strain score   : %.0f/100', trailStrain.score as double)
+    String strainDivider = '-' * 50
+    println strainDivider
+    println 'DISTANCE & EFFORT EQUIVALENTS'
+    println strainDivider
+    println String.format(Locale.ROOT, 'Actual trail distance:       %.1f km', trailStrain.actualDistanceKm as double)
+    println String.format(Locale.ROOT, 'Flat cardio equivalent:      %.1f km (+%.0f%% aerobic demand)', trailStrain.flatCardioKm as double, trailStrain.aerobicDemandPct as double)
+    println String.format(Locale.ROOT, 'Downhill impact surcharge:   +%.1f km (eccentric braking load)', trailStrain.downhillImpactKm as double)
+    println String.format(Locale.ROOT, 'Total flat equivalent:       %.1f km (%.2fx flat walking)', trailStrain.totalEffortKm as double, trailStrain.effortMultiplier as double)
+    println String.format(Locale.ROOT, 'High-strain rough descent:   %.1f km (< -15%% on unpaved ground)', trailStrain.highStrainDescentKm as double)
+    println strainDivider
     println 'Surface breakdown    :'
     (trailStrain.surfaceBreakdown as List<Map>).each { entry ->
         println String.format(Locale.ROOT, '  - %-10s: %.1f%%', entry.surface, entry.pct as double)
@@ -1167,9 +1171,11 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     double steepDescentKm = (descentStrain.steepDescentDistanceM as double) / 1000.0
     double smoothSteepDescentKm = (descentStrain.smoothSteepDescentDistanceM as double) / 1000.0
     double roughSteepDescentKm = (descentStrain.roughSteepDescentDistanceM as double) / 1000.0
-    double trailStrainScore = trailStrain.score as double
-    double effortDistanceKm = trailStrain.effortDistanceKm as double
-    double totalBrakingIndex = trailStrain.totalBrakingIndex as double
+    double flatCardioKm = trailStrain.flatCardioKm as double
+    double downhillImpactKm = trailStrain.downhillImpactKm as double
+    double totalEffortKm = trailStrain.totalEffortKm as double
+    double effortMultiplier = trailStrain.effortMultiplier as double
+    double aerobicDemandPct = trailStrain.aerobicDemandPct as double
     double highStrainDescentKm = trailStrain.highStrainDescentKm as double
     String trailStrainReason = trailStrain.reason
     List<Map> surfaceBreakdown = trailStrain.surfaceBreakdown as List<Map>
@@ -1252,7 +1258,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         String sunLabel = (p1.sunLabel ?: 'Unknown') as String
         String tooltip = String.format(
             Locale.ROOT,
-            '%.2f km | %.0f m | %.1f%% | surface: %s | SAC: %s | eta: %.2f | strain: %.1fx flat equivalent | ' +
+            '%.2f km | %.0f m | %.1f%% | surface: %s | SAC: %s | eta: %.2f | effort: %.1fx flat equivalent | ' +
             '%s | %.1f degC | %.0f W/m2 | %.2fx (%s) | pace -%.0f%%',
             distKm, p1.smoothedEle as double, p1.grade as double, surface, sacScale, eta, strainFactor,
             clockTime, ambientTemp, radiation, segExposure, sunLabel, thermalPenaltyPct
@@ -1340,6 +1346,12 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             font-size: inherit;
             font-weight: inherit;
             color: inherit;
+        }
+        .tile-badge {
+            display: block;
+            font-size: 11px;
+            color: #999;
+            margin-top: 2px;
         }
         .trail-data-note {
             font-size: 12px;
@@ -1459,6 +1471,11 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     <h1>Elevation profile</h1>
     <div class="summary">
         <div><span>Distance</span><strong>${String.format(Locale.ROOT, '%.2f km', distanceKm)}</strong></div>
+        <div>
+            <span>Flat equivalent</span>
+            <strong class="clickable" onclick="showTrailStrainInfo()">${String.format(Locale.ROOT, '%.1f km flat equiv (%.2fx)', totalEffortKm, effortMultiplier)} &#9432;</strong>
+            <div class="tile-badge">Cardio: ${String.format(Locale.ROOT, '%.1f km', flatCardioKm)} | Braking: +${String.format(Locale.ROOT, '%.1f km', downhillImpactKm)}</div>
+        </div>
         <div><span>Ascent</span><strong>${String.format(Locale.ROOT, '%.0f m', ascent)}</strong></div>
         <div><span>Descent</span><strong>${String.format(Locale.ROOT, '%.0f m', descent)}</strong></div>
         <div><span>Duration (DIN 33466)</span><strong>${formatDuration(durationDinHours)} (${String.format(Locale.ROOT, '%.1f km/h', durationDinPaceKmh)})</strong></div>
@@ -1468,12 +1485,11 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         <div><span>Effort (Shenandoah)</span><strong class="clickable" onclick="showEffortInfo()">${effortTier} &#9432;</strong></div>
         <div><span>Water (at <span id="water-tile-temp">${Math.round(waterTempCelsius) as int}</span>&deg;C)</span><strong class="clickable" onclick="showWaterInfo()"><span id="water-tile-value">${String.format(Locale.ROOT, '%.1f L', waterRecommendedCarry)}</span> &#9432;</strong></div>
         <div><span>Steep descent</span><strong class="clickable" onclick="showDescentInfo()">${String.format(Locale.ROOT, '%.2f km', steepDescentKm)} &#9432;</strong></div>
-        <div><span>Trail strain</span><strong class="clickable" onclick="showTrailStrainInfo()">${String.format(Locale.ROOT, '%.0f/100', trailStrainScore)} &#9432;</strong></div>
     </div>
     <div class="mode-toggle">
         <span>Colour by:</span>
         <button type="button" id="mode-gradient-btn" class="mode-btn active" onclick="setColourMode('gradient')">Gradient</button>
-        <button type="button" id="mode-strain-btn" class="mode-btn" onclick="setColourMode('strain')">Strain intensity</button>
+        <button type="button" id="mode-strain-btn" class="mode-btn" onclick="setColourMode('strain')">Relative effort factor</button>
     </div>
     <div style="position: relative;">
         <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
@@ -1591,29 +1607,32 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     </div>
     <div id="trail-strain-modal" class="modal-overlay" onclick="hideTrailStrainInfo()">
         <div class="modal-box" onclick="event.stopPropagation()">
-            <h2>Trail strain score</h2>
+            <h2>Flat equivalent distance</h2>
             <p>${escapeXml(trailStrainReason)}</p>
             <p style="font-size: 12px; color: #666;">
-                As a rough guide: ~50 is about as strenuous as a standard 20 km hike with 500 m
-                of climbing and descending on flat, paved ground - that's the reference point
-                the score is scaled against. Below 50, this route asks less of your legs than
-                that reference day out; into the 60s-70s means real climbing and/or rougher
-                footing; 80+ means sustained steep, technical or high-friction terrain. 100 is
-                the model's practical ceiling (scores are capped there), not a claim that no
-                route can be harder than that.
+                <strong>Flat cardio equivalent</strong> is the aerobic/caloric equivalent distance
+                on flat asphalt (matching a HealthFit/Strava grade-adjusted-pace style figure) -
+                it accounts for climbing, descending and surface roughness, but not braking.
+                <strong>Downhill impact surcharge</strong> is the extra mechanical joint and
+                muscular cost of braking on slopes steeper than -10%, weighted by how rough the
+                surface underfoot is - two descents of the same steepness can load your knees very
+                differently depending on footing. <strong>Total flat equivalent</strong> combines
+                both into one number: the overall fatigue this route is worth, for planning
+                nutrition, pacing and recovery as if it were that many km of flat walking.
             </p>
             <table>
                 <tr><th>Metric</th><th>This route</th></tr>
-                <tr><td>Effort distance</td><td>${String.format(Locale.ROOT, '%.2f km', effortDistanceKm)}</td></tr>
                 <tr><td>Actual distance</td><td>${String.format(Locale.ROOT, '%.2f km', distanceKm)}</td></tr>
-                <tr><td>Braking load index</td><td>${String.format(Locale.ROOT, '%.0f', totalBrakingIndex)}</td></tr>
-                <tr><td>High-strain descent</td><td>${String.format(Locale.ROOT, '%.2f km', highStrainDescentKm)}</td></tr>
+                <tr><td>Flat cardio equivalent</td><td>${String.format(Locale.ROOT, '%.2f km', flatCardioKm)}</td></tr>
+                <tr><td>Downhill impact surcharge</td><td>+${String.format(Locale.ROOT, '%.2f km', downhillImpactKm)}</td></tr>
+                <tr><td><strong>Total flat equivalent</strong></td><td><strong>${String.format(Locale.ROOT, '%.2f km (%.2fx)', totalEffortKm, effortMultiplier)}</strong></td></tr>
+                <tr><td>High-strain rough descent</td><td>${String.format(Locale.ROOT, '%.2f km', highStrainDescentKm)}</td></tr>
                 <tr><th colspan="2">Surface breakdown (% of distance)</th></tr>
                 ${surfaceBreakdown.collect { entry -> "<tr><td>${escapeXml(entry.surface as String)}</td><td>${String.format(Locale.ROOT, '%.1f%%', entry.pct as double)}</td></tr>" }.join('\n                ')}
             </table>
             <p style="font-size: 12px; color: #666;">
-                Toggle the profile above to "Strain intensity" to see where the effort/impact is
-                concentrated along the route, rather than just the raw gradient.
+                Toggle the profile above to "Relative effort factor" to see where the effort/impact
+                is concentrated along the route, rather than just the raw gradient.
             </p>
             <button onclick="hideTrailStrainInfo()">Close</button>
         </div>

@@ -93,13 +93,12 @@ moving time very differently:
      extrapolating further, since no calibration data exists past those
      grades.
    - `eta` here is a separate, calibrated speed-only terrain factor
-     (`speedTerrainFactorForSurface` in the code) — 1.0 for firm surfaces
+     (`speedEtaFromResolvedEta` in the code) — 1.0 for firm surfaces
      (paved/compacted), 1.05 for everything else. This is **not** the
-     same `eta` used by the Trail strain model below: that one keeps its
-     original, wider 1.0-1.9 scale, since its own reference-route
-     calibration and thresholds are tuned against it, and recalibrating
-     it against pace data would silently flatten the strain score's
-     terrain sensitivity too.
+     same `eta` used by the flat equivalent distance model below: that one
+     keeps its original, wider 1.0-1.9 scale, since its own thresholds are
+     tuned against it, and recalibrating it against pace data would
+     silently flatten its terrain sensitivity too.
 
    Unlike DIN's fixed 800 m/h descent rate, this explicitly varies pace
    with rough or technical terrain rather than assuming descending is
@@ -403,11 +402,13 @@ split by surface:
 - **Rough**: everything else, eta above 1.10 — including unknown, when no
   OSM match is available at all.
 
-## Trail strain model
+## Flat equivalent distance model
 
-A fourth clickable tile, "Trail strain", combines terrain and technical
-difficulty with gradient into a single 0-100 score, separating *metabolic*
-cost (how tiring) from *biomechanical* cost (how jarring):
+A fourth clickable tile, "Flat equivalent", expresses terrain and technical
+difficulty as a distance in kilometres — how far this route is worth on flat
+pavement — rather than an abstract 0-100 score, matching how tools like
+HealthFit/Strava's grade-adjusted pace present the same idea. It separates
+*metabolic* cost (how tiring) from *biomechanical* cost (how jarring):
 
 - **Terrain factor (eta)**: how much harder a surface is to move over than
   firm pavement, resolved through the five-tier fallback hierarchy
@@ -418,25 +419,27 @@ cost (how tiring) from *biomechanical* cost (how jarring):
 - **Technical factor**: from the OSM `sac_scale` tag — 1.0 for
   hiking/T1/none, 1.15 for mountain_hiking/T2, 1.35 for
   demanding_mountain_hiking/T3, 1.6 for alpine_hiking/T4 and above.
-- **Metabolic cost**: [Minetti's polynomial approximation](https://en.wikipedia.org/wiki/Locomotion_energetics)
+- **Flat cardio equivalent**: [Minetti's polynomial approximation](https://en.wikipedia.org/wiki/Locomotion_energetics)
   of energy cost per unit distance as a function of gradient, normalised so
   flat pavement costs exactly `1.0` ("as costly as walking flat ground"),
-  then scaled by the terrain and technical factors. Summed and divided by
-  1000, this gives the **effort distance**: the equivalent flat-paved
-  distance this route actually costs to walk.
-- **Eccentric braking strain**: on any segment steeper than -10%, an
+  then scaled by the terrain and technical factors, summed and divided by
+  1000. This is the aerobic/caloric equivalent distance on flat asphalt —
+  how far this route "counts as" for cardio purposes.
+- **Downhill impact surcharge**: on any segment steeper than -10%, an
   additional `(|grade| / 10%)²` penalty (also scaled by terrain/technical
-  factor) models the extra quad/knee loading from braking on a steep
-  descent — this grows quickly, since braking strain compounds with both
-  steepness and rough footing.
-- **Composite score**: `effort distance + braking index/1000`, scaled so a
-  reference 20 km / 500 m route on flat T1 pavement lands at 50/100 — so a
-  score meaningfully above 50 indicates a route that's harder, in this
-  combined sense, than a "standard" 20 km day out.
+  factor), summed and divided by 1000 to express it in the same km units.
+  This models the extra quad/knee eccentric-braking load from a steep
+  descent — it grows quickly, since braking strain compounds with both
+  steepness and rough footing — and is reported as a surcharge *on top of*
+  the flat cardio equivalent, not folded invisibly into one number.
+- **Total flat equivalent**: `flat cardio equivalent + downhill impact
+  surcharge`, with an **effort multiplier** (`total / actual distance`) —
+  e.g. a 20 km route with a 1.45x multiplier is worth 29 km of flat walking
+  for pacing, nutrition and recovery planning.
 
 The tile's popup also lists the surface breakdown by % of distance, and the
-high-strain descent distance (descents steeper than -15% on a rough or
-loose surface, i.e. eta >= 1.25).
+high-strain rough descent distance (descents steeper than -15% on a rough or
+loose surface, i.e. eta >= 1.25) — the combination that loads joints hardest.
 
 ## Visual output
 
@@ -447,10 +450,12 @@ The HTML file contains a self-contained, responsive SVG elevation profile:
     descent -15% to 0% (light cyan), flat/mild 0-6% (green), moderate climb
     6-12% (yellow), steep climb 12-20% (orange), severe climb above 20%
     (red).
-  - **Strain intensity**: the combined metabolic + braking strain at each
-    point, from low (cyan) through flat-equivalent (green), moderate
-    (yellow), high (orange) to extreme (dark red) — this can highlight
-    rough, technical descents that a pure-gradient view would just show as
+  - **Relative effort factor**: the combined metabolic + braking load at
+    each point, expressed as an instantaneous flat-equivalent multiplier
+    (`local_minetti_mult * eta * T-factor + local_braking_penalty`), from
+    low (cyan) through flat-equivalent (green, ~1.0x) and moderate (yellow)
+    to high/extreme (orange/dark red, 2.5x+) — this can highlight rough,
+    technical descents that a pure-gradient view would just show as
     "steep".
 - A thin solar intensity band runs along the top of the chart: dark
   (shade/twilight), amber (partial sun) or orange (full sun), giving an
@@ -460,7 +465,7 @@ The HTML file contains a self-contained, responsive SVG elevation profile:
   its time, duration and distance).
 - Hovering over the profile shows a crosshair at that point, plus a tooltip
   with distance, elevation, instantaneous gradient, surface type, SAC trail
-  scale, the local terrain multiplier (eta), the relative strain factor
+  scale, the local terrain multiplier (eta), the relative effort factor
   (e.g. "1.4x flat equivalent"), the simulated (break-delayed) clock time,
   ambient temperature, direct solar radiation, the dynamic exposure
   multiplier (e.g. "1.18x (Full sun)") and the resulting thermal pace

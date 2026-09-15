@@ -9,3 +9,6 @@ gpx/
 # replaced by the Overpass API, which needs no key), kept ignored in case a
 # stray file with old key material is still present.
 .env
+
+# macOS Finder metadata, not source data
+.DS_Store
