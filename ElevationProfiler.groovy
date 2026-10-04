@@ -226,6 +226,75 @@ List<Map> applyTerrainElevation(List<Map> points, TerrainModel terrain) {
     dense
 }
 
+// Gradient bands for splitting ascent and descent: 0-5, 5-10, 10-15, 15-20, 20-30 and over 30%.
+// Total ascent says little about effort on its own - gentle undulation is largely paid back
+// on the way down, while steep climbs and descents cost nearly in full, and steep descent is
+// what loads the knees - so the split is reported alongside the totals.
+List<Double> gradientBandEdgesPct() {
+    [5.0, 10.0, 15.0, 20.0, 30.0]
+}
+
+List<String> gradientBandLabels() {
+    List<Double> edges = [0.0] + gradientBandEdgesPct()
+    List<String> labels = []
+    for (int i = 1; i < edges.size(); i++) {
+        labels << String.format(Locale.ROOT, '%.0f-%.0f%%', edges[i - 1], edges[i])
+    }
+    labels << String.format(Locale.ROOT, '>%.0f%%', edges[-1])
+    labels
+}
+
+int gradientBandIndex(double gradePct) {
+    List<Double> edges = gradientBandEdgesPct()
+    int index = 0
+    while (index < edges.size() && Math.abs(gradePct) >= edges[index]) {
+        index++
+    }
+    index
+}
+
+// Smoothed elevation at a distance along the route, interpolated between points.
+double smoothedEleAtDistance(List<Map> points, double distanceM) {
+    int lo = 0
+    int hi = points.size() - 1
+    if (distanceM <= (points[lo].distance as double)) {
+        return points[lo].smoothedEle as double
+    }
+    if (distanceM >= (points[hi].distance as double)) {
+        return points[hi].smoothedEle as double
+    }
+    while (hi - lo > 1) {
+        int mid = (lo + hi).intdiv(2)
+        if ((points[mid].distance as double) <= distanceM) {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    double d0 = points[lo].distance as double
+    double d1 = points[hi].distance as double
+    double f = d1 > d0 ? (distanceM - d0) / (d1 - d0) : 0.0
+    (points[lo].smoothedEle as double) + ((points[hi].smoothedEle as double) - (points[lo].smoothedEle as double)) * f
+}
+
+// Gradient of one counted climb or drop, measured over at least baselineM centred on it, so
+// a short step between closely spaced points doesn't come out exaggeratedly steep.
+double countedStepGradePct(List<Map> points, int fromIndex, int toIndex, double baselineM) {
+    double d0 = points[fromIndex].distance as double
+    double d1 = points[toIndex].distance as double
+    if (d1 - d0 < baselineM) {
+        double mid = (d0 + d1) / 2.0
+        d0 = mid - baselineM / 2.0
+        d1 = mid + baselineM / 2.0
+    }
+    d0 = Math.max(d0, points[0].distance as double)
+    d1 = Math.min(d1, points[-1].distance as double)
+    if (d1 <= d0) {
+        return 0.0
+    }
+    (smoothedEleAtDistance(points, d1) - smoothedEleAtDistance(points, d0)) / (d1 - d0) * 100.0
+}
+
 Map computeBoundingBox(List<Map> points) {
     double padDegrees = 0.005
     double minLat = points.collect { it.lat as double }.min() - padDegrees
@@ -1156,11 +1225,19 @@ String formatDuration(double hours) {
     String.format(Locale.ROOT, '%dh %02dmin', h, m)
 }
 
-void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult, Map dynamicResult, Map surfaceAttribution) {
+void printSummary(double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult, Map dynamicResult, Map surfaceAttribution, Map elevationSummary) {
     println '=== Elevation profile summary ==='
     println String.format(Locale.ROOT, 'Total distance : %.2f km', distanceKm)
     println String.format(Locale.ROOT, 'Total ascent   : %.0f m', ascent)
     println String.format(Locale.ROOT, 'Total descent  : %.0f m', descent)
+    println "Elevation from : ${elevationSummary.source}"
+    println 'Gradient band    ascent      descent'
+    List<double[]> bands = elevationSummary.bands as List<double[]>
+    (elevationSummary.bandLabels as List<String>).eachWithIndex { String label, int i ->
+        println String.format(Locale.ROOT, '  %-8s %6.0f m %3.0f%%  %6.0f m %3.0f%%', label,
+            bands[i][0], ascent > 0 ? bands[i][0] / ascent * 100.0 : 0.0, bands[i][1], descent > 0 ? bands[i][1] / descent * 100.0 : 0.0)
+    }
+    println String.format(Locale.ROOT, 'Steeper than 15%%: %.0f m up, %.0f m down', elevationSummary.steepAscent as double, elevationSummary.steepDescent as double)
     double deltaMinutes = durationResult.deltaMinutes as double
     String deltaSign = deltaMinutes >= 0 ? '+' : '-'
     println "DIN 33466 duration       : ${formatDuration(durationResult.dinDurationHours as double)}"
@@ -1328,7 +1405,7 @@ String buildWaterChart(List<Map> chartData, double maxScaleLitres) {
 ${bars}</svg>"""
 }
 
-String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult, Map dynamicResult, List<Map> breakEvents) {
+String buildHtml(List<Map> points, double distanceKm, double ascent, double descent, double durationHours, Map difficultyResult, Map shenandoahResult, Map waterResult, Map trailInfo, Map descentStrain, Map trailStrain, Map durationResult, Map dynamicResult, List<Map> breakEvents, Map elevationSummary) {
     String difficulty = difficultyResult.tier
     String difficultyReason = difficultyResult.reason
     double maxGrade = difficultyResult.maxGrade as double
@@ -1494,6 +1571,12 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         grid << "<line x1=\"${fmt(x)}\" y1=\"${fmt(axisY)}\" x2=\"${fmt(x)}\" y2=\"${fmt(axisY + 6)}\" stroke=\"#999\" stroke-width=\"1\" />\n"
         grid << "<text x=\"${fmt(x)}\" y=\"${fmt(axisY + 20)}\" text-anchor=\"middle\" font-size=\"11\" fill=\"#666\">${String.format(Locale.ROOT, '%.0f km', km)}</text>\n"
     }
+
+    boolean elevationFromTerrain = elevationSummary.source != 'GPX file'
+    List<double[]> elevationBands = elevationSummary.bands as List<double[]>
+    String elevationBandRows = (elevationSummary.bandLabels as List<String>).withIndex().collect { String label, int i ->
+        String.format(Locale.ROOT, '<tr><td>%s</td><td>%.0f m</td><td>%.0f m</td></tr>', label, elevationBands[i][0], elevationBands[i][1])
+    }.join('\n                ')
 
     String legend = buildLegend(width, height, padding)
     String strainLegend = buildStrainLegend(width, height, padding)
@@ -1667,8 +1750,16 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             <strong class="clickable" onclick="showTrailStrainInfo()">${String.format(Locale.ROOT, '%.1f km flat equiv (%.2fx)', totalEffortKm, effortMultiplier)} &#9432;</strong>
             <div class="tile-badge">Cardio: ${String.format(Locale.ROOT, '%.1f km', flatCardioKm)} | Braking: +${String.format(Locale.ROOT, '%.1f km', downhillImpactKm)}</div>
         </div>
-        <div><span>Ascent</span><strong>${String.format(Locale.ROOT, '%.0f m', ascent)}</strong></div>
-        <div><span>Descent</span><strong>${String.format(Locale.ROOT, '%.0f m', descent)}</strong></div>
+        <div>
+            <span>Ascent</span>
+            <strong class="clickable" onclick="showElevationInfo()">${String.format(Locale.ROOT, '%.0f m', ascent)} &#9432;</strong>
+            <div class="tile-badge">${String.format(Locale.ROOT, '%.0f m', elevationSummary.steepAscent as double)} steeper than 15%</div>
+        </div>
+        <div>
+            <span>Descent</span>
+            <strong class="clickable" onclick="showElevationInfo()">${String.format(Locale.ROOT, '%.0f m', descent)} &#9432;</strong>
+            <div class="tile-badge">${String.format(Locale.ROOT, '%.0f m', elevationSummary.steepDescent as double)} steeper than 15%</div>
+        </div>
         <div><span>Duration (DIN 33466)</span><strong>${formatDuration(durationDinHours)} (${String.format(Locale.ROOT, '%.1f km/h', durationDinPaceKmh)})</strong></div>
         <div><span>Duration (terrain adjusted)</span><strong class="clickable" onclick="showDurationInfo()"><span id="duration-tile-value">${formatDuration(durationEffortHours)} (${String.format(Locale.ROOT, '%.1f km/h', durationEffortPaceKmh)})</span> &#9432;</strong></div>
         <div><span>Elapsed (door-to-door)</span><strong class="clickable" onclick="showDurationInfo()">${formatDuration(dynamicElapsedHours)} &#9432;</strong></div>
@@ -1771,6 +1862,28 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
                 <tr><td>Recommended carry (incl. ${String.format(Locale.ROOT, '%.1f', waterReserveVolume)} L reserve)</td><td><strong id="water-value">${String.format(Locale.ROOT, '%.1f', waterRecommendedCarry)}</strong> L</td></tr>
             </table>
             <button onclick="hideWaterInfo()">Close</button>
+        </div>
+    </div>
+    <div id="elevation-modal" class="modal-overlay" onclick="hideElevationInfo()">
+        <div class="modal-box" onclick="event.stopPropagation()">
+            <h2>Ascent and descent by gradient</h2>
+            <p>
+                Total ascent says little about effort on its own: gentle up-and-down is largely
+                paid back on the way down, while steep climbs and descents cost nearly in full,
+                and steep descent is what loads the knees. Each counted climb or drop is classed
+                by the gradient over at least 25 m around it; the bands add up to the totals.
+            </p>
+            <table>
+                <tr><th>Gradient</th><th>Ascent</th><th>Descent</th></tr>
+                ${elevationBandRows}
+                <tr><td><strong>Steeper than 15%</strong></td><td><strong>${String.format(Locale.ROOT, '%.0f m', elevationSummary.steepAscent as double)}</strong></td><td><strong>${String.format(Locale.ROOT, '%.0f m', elevationSummary.steepDescent as double)}</strong></td></tr>
+            </table>
+            <p style="font-size: 12px; color: #666;">
+                ${elevationFromTerrain
+                    ? 'Elevations come from the IGN MDT05 terrain model (5 m cells), sampled every 5 m along the route, since a planned route\'s own GPX elevations are usually smoothed map data that cut off summits and lose short climbs. A climb or drop counts once it reaches 0.5 m.'
+                    : 'Elevations come from the GPX file itself. A planned route\'s GPX elevations are often smoothed map data, which can cut off summits and lose short climbs, so ascent may be undercounted.'}
+            </p>
+            <button onclick="hideElevationInfo()">Close</button>
         </div>
     </div>
     <div id="descent-modal" class="modal-overlay" onclick="hideDescentInfo()">
@@ -2034,6 +2147,16 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             updateDurationSlider();
         }
 
+        var elevationModal = document.getElementById('elevation-modal');
+
+        function showElevationInfo() {
+            elevationModal.classList.add('open');
+        }
+
+        function hideElevationInfo() {
+            elevationModal.classList.remove('open');
+        }
+
         var descentModal = document.getElementById('descent-modal');
 
         function showDescentInfo() {
@@ -2122,6 +2245,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
                 hideEffortInfo();
                 hideWaterInfo();
                 hideDescentInfo();
+                hideElevationInfo();
                 hideTrailStrainInfo();
                 hideDurationInfo();
             }
@@ -2413,16 +2537,22 @@ if (weatherMatched) {
 // keep the original behaviour of summing every change. 0.5 m matched the Apple Watch's
 // barometric ascent with no overall bias across 11 recorded GR92 stages.
 double ascentThresholdM = elevationSourceLabel == 'GPX file' ? 0.0 : 0.5
-double ascentReferenceEle = points[0].smoothedEle as double
+int ascentReferenceIndex = 0
+// Each counted climb or drop also goes into a gradient band, [ascent, descent] per band, so
+// the bands always add up exactly to the totals.
+List<double[]> gradientBands = gradientBandLabels().collect { new double[2] }
 for (int i = 1; i < points.size(); i++) {
-    double eleChange = (points[i].smoothedEle as double) - ascentReferenceEle
+    double eleChange = (points[i].smoothedEle as double) - (points[ascentReferenceIndex].smoothedEle as double)
     if (Math.abs(eleChange) >= ascentThresholdM) {
+        double[] band = gradientBands[gradientBandIndex(countedStepGradePct(points, ascentReferenceIndex, i, 25.0))]
         if (eleChange > 0) {
             totalAscent += eleChange
-        } else {
+            band[0] += eleChange
+        } else if (eleChange < 0) {
             totalDescent += -eleChange
+            band[1] += -eleChange
         }
-        ascentReferenceEle = points[i].smoothedEle as double
+        ascentReferenceIndex = i
     }
 
     // Consecutive GPS fixes can sit only centimetres apart, so grade is measured
@@ -2571,6 +2701,14 @@ Map descentStrain = [
 ]
 
 double totalDistanceKm = cumulative / 1000.0
+int steepBandStart = gradientBandIndex(15.0)
+Map elevationSummary = [
+    source: elevationSourceLabel,
+    bandLabels: gradientBandLabels(),
+    bands: gradientBands,
+    steepAscent: gradientBands.drop(steepBandStart).sum { it[0] } as double,
+    steepDescent: gradientBands.drop(steepBandStart).sum { it[1] } as double
+]
 double durationHours = din33466Duration(totalDistanceKm, totalAscent, totalDescent)
 Map difficultyResult = classifyDifficulty(totalAscent, totalDistanceKm, maxGrade, clampedGradeCount)
 Map shenandoahResult = shenandoahDifficulty(totalAscent, totalDistanceKm)
@@ -2584,8 +2722,8 @@ Map dynamicResult = dynamicWeatherSummary(
     totalDynamicWaterLitres, totalBreakWaterLitres, waterResult.recommendedCarry as double, weatherMatched
 )
 
-printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult, surfaceAttribution)
+printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult, surfaceAttribution, elevationSummary)
 
 File output = options.outputPath ? new File(options.outputPath) : new File(options.gpxFile.absoluteFile.parentFile, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '-profile.html')
-output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult, breakEvents)
+output.text = buildHtml(points, totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult, breakEvents, elevationSummary)
 println "Elevation profile written to: ${output.absolutePath}"

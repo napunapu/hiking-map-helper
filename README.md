@@ -72,6 +72,14 @@ tool itself, so nothing under it is tracked or pushed.
   once the profile has moved 0.5 m from the last counted point, so small
   wobble is ignored but slow, steady climbs still count in full; with
   `--elevation gpx`, every change is summed as before.
+- **Gradient bands**: ascent and descent split by gradient (0-5, 5-10,
+  10-15, 15-20, 20-30 and over 30%), each counted climb or drop classed by
+  the gradient over at least 25 m around it, so the bands add up exactly to
+  the totals. Total ascent says little about effort on its own: gentle
+  up-and-down is largely paid back on the way down, while steep climbs and
+  descents cost nearly in full, and steep descent is what loads the knees.
+  The console prints the bands; in the HTML, the Ascent and Descent tiles
+  show the metres steeper than 15% and open a popup with the full split.
 
 ## Elevation from the terrain model
 
@@ -105,6 +113,9 @@ default the tool therefore replaces them with heights from the IGN
   planned GPX elevations read about 20% low on average and up to 45% low
   on a single stage. The terrain-adjusted moving time stayed within about
   3% of the recorded moving time on average, without recalibration.
+  Gradient bands read somewhat steeper than the watch's (about 10-15% more
+  metres steeper than 15%), most likely because a planned route's straight
+  lines cut corners on switchbacks the walker actually follows.
 
 Since the route is densified, the HTML profile draws at most one segment
 per horizontal pixel to keep the file size in check.
