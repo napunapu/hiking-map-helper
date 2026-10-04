@@ -547,9 +547,26 @@ Map<Long, Double> readGpxAltitudes(java.io.File gpxFile) {
 // space ("Apple\u00a0Watch") that a re-export or rename can turn into a normal one, so names
 // are compared with all whitespace normalised.
 java.io.File matchingGpx(java.io.File fitFile) {
-    Closure<String> stem = { String name -> name.replaceFirst(/(?i)\.(fit|gpx)$/, '').replaceAll(/[\s\u00a0]+/, ' ') }
+    matchingSibling(fitFile, '.gpx')
+}
+
+java.io.File matchingSibling(java.io.File fitFile, String suffix) {
+    Closure<String> stem = { String name -> name.replaceFirst(/(?i)\.(fit|gpx|notes\.txt)$/, '').replaceAll(/[\s\u00a0]+/, ' ') }
     String wanted = stem(fitFile.name)
-    fitFile.absoluteFile.parentFile.listFiles()?.find { it.name.toLowerCase().endsWith('.gpx') && stem(it.name) == wanted }
+    fitFile.absoluteFile.parentFile.listFiles()?.find { it.name.toLowerCase().endsWith(suffix) && stem(it.name) == wanted }
+}
+
+// A short note on how the walk felt, kept as <walk>.notes.txt next to the FIT file. Lines
+// starting with # are comments; a comment containing "draft" marks the note as an unchecked
+// best guess (e.g. drafted from the recorded data), shown as such.
+Map readWalkNotes(java.io.File fitFile) {
+    java.io.File notesFile = matchingSibling(fitFile, '.notes.txt')
+    if (!notesFile) {
+        return null
+    }
+    List<String> lines = notesFile.readLines('UTF-8')
+    String text = lines.findAll { !it.trim().startsWith('#') }.join(' ').replaceAll(/\s+/, ' ').trim()
+    text ? [text: text, draft: lines.any { it.trim().startsWith('#') && it.toLowerCase().contains('draft') }] : null
 }
 
 // Loads the FIT file's per-second records, session totals and heart-rate zones. Records keep
@@ -1035,6 +1052,10 @@ Map analyse(java.io.File file, Options options) {
     long start = records[0].epochSecond as long
     long finish = records[-1].epochSecond as long
     println String.format(Locale.ROOT, 'Walk           : %s, %s-%s local time', summary.date, clock(start, LOCAL_ZONE), clock(finish, LOCAL_ZONE))
+    Map notes = readWalkNotes(file)
+    if (notes) {
+        println "How it felt${notes.draft ? ' (draft, unchecked)' : ''}: ${notes.text}"
+    }
 
     Map correction = null
     if (!options.noTerrainStart) {

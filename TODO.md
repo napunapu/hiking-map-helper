@@ -39,14 +39,3 @@ same calibrated eta as ordinary dirt/gravel in the speed model. Running the
 calibrator against a recorded track that covers genuinely rough or loose
 terrain would let severe-loose surfaces be calibrated distinctly instead of
 inheriting a value derived mostly from firmer trail.
-
-## Notes on how each walk felt
-
-For every recorded walk with FIT and GPX files, keep a short note (a
-sentence or a few) on how the walk felt - tiredness, heat, knees on the
-descents, pace, anything unusual - and show it in `WalkAnalyser.groovy`'s
-report next to the measured figures. Subjective effort is the missing
-check on the heart-rate and flat equivalent figures, and it would flag
-walks to treat as outliers (like the all-out 15 September walk). One
-option is a plain-text or Markdown note next to each FIT file with the
-same name, kept under the gitignored `gpx/real_world/` with the walks.

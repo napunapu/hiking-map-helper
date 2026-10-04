@@ -301,6 +301,14 @@ walk it reports:
   as described above. Responses are cached once a walk is a week old, since
   more recent archive data can still be revised.
 
+A note on how the walk felt can sit next to the FIT file as
+`<walk>.notes.txt` (same name, whitespace normalised as for the GPX): its
+text is shown under the walk's header. Lines starting with `#` are
+comments, and a comment containing "draft" marks the note as an unchecked
+best guess, for example one drafted from the recorded figures, until you
+edit it and delete that line. Notes are personal data and stay with the
+walks under the gitignored `gpx/`.
+
 With several files, a final table compares the walks side by side. Its
 ascent, descent and steep figures reproduce the separate Python analyser
 these rules come from exactly on the 11 recorded GR92 walks.
