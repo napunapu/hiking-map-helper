@@ -549,17 +549,32 @@ Map landcoverMatchFor(double plat, double plon, List<Map> landcoverFeatures, dou
     (bestNatural != null && bestDist <= thresholdM) ? [natural: bestNatural, distanceM: bestDist] : null
 }
 
-Map computeCentroid(List<Map> points) {
-    double lat = points.collect { it.lat as double }.sum() / points.size()
-    double lon = points.collect { it.lon as double }.sum() / points.size()
-    [lat: lat, lon: lon]
+// Weather is sampled at fixed points along the route - the start, one every spacingM of
+// distance, and the finish - each with its own elevation, rather than at the route's centre,
+// so a long stage climbing from the coast inland gets the temperature where each part
+// actually is. Fixed positions (rather than ones tied to a simulated passing time) keep the
+// cached response independent of --start-time and pace; the simulation then picks the
+// nearest sample for each segment.
+List<Map> weatherSamplePoints(List<Map> points, double spacingM) {
+    List<Map> samples = [[lat: points[0].lat, lon: points[0].lon, ele: points[0].ele, distanceM: 0.0d]]
+    double cumulative = 0.0
+    double nextSampleM = spacingM
+    for (int i = 1; i < points.size(); i++) {
+        cumulative += haversine(points[i - 1].lat as double, points[i - 1].lon as double, points[i].lat as double, points[i].lon as double)
+        boolean last = i == points.size() - 1
+        if (cumulative >= nextSampleM || last) {
+            samples << [lat: points[i].lat, lon: points[i].lon, ele: points[i].ele, distanceM: cumulative]
+            nextSampleM = cumulative + spacingM
+        }
+    }
+    samples
 }
 
 String fetchWeatherResponse(String url) {
     HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
     HttpRequest request = HttpRequest.newBuilder()
         .uri(URI.create(url))
-        .timeout(Duration.ofSeconds(30))
+        .timeout(Duration.ofSeconds(60))
         .GET()
         .build()
 
@@ -570,39 +585,65 @@ String fetchWeatherResponse(String url) {
     response.body()
 }
 
-// forecast_days=16 (Open-Meteo's maximum) means one cached response stays valid for any
-// --date within the next 16 days, not just today, without a date-specific query.
-String fetchWeatherForecastRaw(double lat, double lon) {
-    String url = "https://api.open-meteo.com/v1/forecast?latitude=${String.format(Locale.ROOT, '%.5f', lat)}" +
-        "&longitude=${String.format(Locale.ROOT, '%.5f', lon)}" +
-        '&hourly=temperature_2m,direct_radiation,cloud_cover&timezone=auto&forecast_days=16'
-    fetchWeatherResponse(url)
+// All samples go in one request as comma-separated latitude/longitude/elevation lists;
+// passing each sample's elevation makes Open-Meteo adjust its temperature for height instead
+// of using its own coarse model grid's terrain. Humidity, direct normal irradiance and wind
+// feed the felt-temperature (UTCI) model.
+String weatherLocationQuery(List<Map> samples) {
+    'latitude=' + samples.collect { String.format(Locale.ROOT, '%.5f', it.lat as double) }.join(',') +
+        '&longitude=' + samples.collect { String.format(Locale.ROOT, '%.5f', it.lon as double) }.join(',') +
+        '&elevation=' + samples.collect { String.format(Locale.ROOT, '%.0f', it.ele as double) }.join(',') +
+        '&hourly=temperature_2m,direct_radiation,cloud_cover,relative_humidity_2m,direct_normal_irradiance,wind_speed_10m' +
+        '&wind_speed_unit=ms&timezone=auto'
+}
+
+// forecast_days=16 (Open-Meteo's maximum) means one response covers any --date within the
+// next 16 days, not just today, without a date-specific query.
+String fetchWeatherForecastRaw(List<Map> samples) {
+    fetchWeatherResponse("https://api.open-meteo.com/v1/forecast?${weatherLocationQuery(samples)}&forecast_days=16")
 }
 
 // The Archive API has no rolling forward window like the Forecast API does, so it's
 // queried for the single requested day only - the cache is only valid for that exact
 // date (checked via timelineCoversDate before trusting it).
-String fetchWeatherArchiveRaw(double lat, double lon, LocalDate date) {
-    String url = "https://archive-api.open-meteo.com/v1/archive?latitude=${String.format(Locale.ROOT, '%.5f', lat)}" +
-        "&longitude=${String.format(Locale.ROOT, '%.5f', lon)}" +
-        "&start_date=${date}&end_date=${date}" +
-        '&hourly=temperature_2m,direct_radiation,cloud_cover&timezone=auto'
-    fetchWeatherResponse(url)
+String fetchWeatherArchiveRaw(List<Map> samples, LocalDate date) {
+    fetchWeatherResponse("https://archive-api.open-meteo.com/v1/archive?${weatherLocationQuery(samples)}&start_date=${date}&end_date=${date}")
 }
 
-Map parseWeatherTimeline(Map weatherData) {
-    if (!weatherData || !weatherData.hourly) {
+// Open-Meteo answers a multi-location request with a JSON array, one entry per location in
+// request order, but a single location with a plain object. Returns null if the response
+// doesn't match these samples - a different count or elevations, e.g. a cache written by an
+// older version that only queried the route's centre, or with the other --elevation source.
+Map parseWeatherTimeline(Object weatherData, List<Map> samples) {
+    if (!weatherData) {
         return null
     }
-    Map hourly = weatherData.hourly as Map
-    if (!hourly.time || !hourly.temperature_2m || !hourly.direct_radiation) {
+    List locations = weatherData instanceof List ? weatherData as List : [weatherData]
+    if (locations.size() != samples.size()) {
         return null
     }
-    [
-        times: hourly.time as List,
-        temps: (hourly.temperature_2m as List).collect { (it ?: 0.0) as double },
-        radiation: (hourly.direct_radiation as List).collect { (it ?: 0.0) as double }
-    ]
+    List<Map> parsed = []
+    for (int k = 0; k < locations.size(); k++) {
+        Map location = locations[k] as Map
+        Map hourly = location?.hourly as Map
+        if (!hourly?.time || !hourly.temperature_2m || !hourly.direct_radiation || !hourly.relative_humidity_2m ||
+            !hourly.direct_normal_irradiance || !hourly.wind_speed_10m) {
+            return null
+        }
+        if (location.elevation != null && Math.abs((location.elevation as double) - Math.round(samples[k].ele as double)) > 1.0) {
+            return null
+        }
+        parsed << [
+            distanceM: samples[k].distanceM as double,
+            times: hourly.time as List,
+            temps: (hourly.temperature_2m as List).collect { (it ?: 0.0) as double },
+            radiation: (hourly.direct_radiation as List).collect { (it ?: 0.0) as double },
+            humidity: (hourly.relative_humidity_2m as List).collect { (it ?: 0.0) as double },
+            dni: (hourly.direct_normal_irradiance as List).collect { (it ?: 0.0) as double },
+            wind: (hourly.wind_speed_10m as List).collect { (it ?: 0.0) as double }
+        ]
+    }
+    [samples: parsed]
 }
 
 // The Archive API's response only covers the single requested day, unlike the Forecast
@@ -613,22 +654,23 @@ boolean timelineCoversDate(Map timeline, LocalDate date) {
         return false
     }
     String prefix = date.toString()
-    (timeline.times as List<String>).any { it.startsWith(prefix) }
+    (timeline.samples as List<Map>).every { sample -> (sample.times as List<String>).any { it.startsWith(prefix) } }
 }
 
-// Linearly interpolates the hourly Open-Meteo timeline at an arbitrary local timestamp,
-// falling back to the nearest end point if the target falls outside the fetched range.
-Map weatherAtTime(Map timeline, LocalDateTime target) {
+// Weather at a distance along the route and a local timestamp: the nearest sample point by
+// distance, linearly interpolated between its hourly readings, falling back to the nearest
+// end point if the target falls outside the fetched range.
+Map weatherAt(Map timeline, double distanceM, LocalDateTime target) {
     if (!timeline) {
         return null
     }
-    List<String> times = timeline.times as List<String>
-    List<Double> temps = timeline.temps as List<Double>
-    List<Double> radiation = timeline.radiation as List<Double>
+    Map sample = (timeline.samples as List<Map>).min { Math.abs((it.distanceM as double) - distanceM) }
+    List<String> times = sample.times as List<String>
     int n = times.size()
     if (n == 0) {
         return null
     }
+    Closure<Map> valuesAt = { int i -> [temp: sample.temps[i], radiation: sample.radiation[i], humidity: sample.humidity[i], dni: sample.dni[i], wind: sample.wind[i]] }
 
     DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm")
     int idx = -1
@@ -641,11 +683,10 @@ Map weatherAtTime(Map timeline, LocalDateTime target) {
     }
 
     if (idx == -1) {
-        int last = n - 1
-        return [temp: temps[last], radiation: radiation[last]]
+        return valuesAt(n - 1)
     }
     if (idx == 0) {
-        return [temp: temps[0], radiation: radiation[0]]
+        return valuesAt(0)
     }
 
     LocalDateTime beforeT = LocalDateTime.parse(times[idx - 1], fmt)
@@ -654,10 +695,9 @@ Map weatherAtTime(Map timeline, LocalDateTime target) {
     long elapsedMinutes = Duration.between(beforeT, target).toMinutes()
     double frac = totalMinutes > 0 ? Math.max(0.0, Math.min(1.0, elapsedMinutes / (double) totalMinutes)) : 0.0
 
-    double temp = (temps[idx - 1] as double) + ((temps[idx] as double) - (temps[idx - 1] as double)) * frac
-    double rad = (radiation[idx - 1] as double) + ((radiation[idx] as double) - (radiation[idx - 1] as double)) * frac
-
-    [temp: temp, radiation: rad]
+    Map before = valuesAt(idx - 1)
+    Map after = valuesAt(idx)
+    before.collectEntries { key, value -> [key, (value as double) + ((after[key] as double) - (value as double)) * frac] }
 }
 
 // Baseline solar factor from direct radiation alone, before any canopy/terrain damping.
@@ -1038,8 +1078,8 @@ Map dynamicWeatherSummary(
     String reason = weatherMatched
         ? String.format(
             Locale.ROOT,
-            'Simulated from a %s start using live Open-Meteo hourly forecast data (temperature, direct ' +
-            'solar radiation, cloud cover) at this route\'s midpoint location, combined with the matched ' +
+            'Simulated from a %s start using Open-Meteo hourly weather data (temperature, direct solar ' +
+            'radiation) sampled about every 1.5 km along the route at each point\'s own elevation, combined with the matched ' +
             'OpenStreetMap canopy (tunnels, forest, open ridges) to estimate real sun exposure and heat ' +
             'load per segment. %d scheduled break%s (%.0f min total) shift every later segment\'s weather ' +
             'lookup to the delayed wall clock, rather than a single flat assumption for the whole hike.',
@@ -1244,7 +1284,7 @@ void printSummary(double distanceKm, double ascent, double descent, double durat
     println "Effort-adjusted duration : ${formatDuration(durationResult.effortDurationHours as double)} (delta: ${deltaSign}${Math.round(Math.abs(deltaMinutes)) as int} min)"
     println String.format(Locale.ROOT, 'DIN hydration need       : %.1f L', durationResult.dinConsumption as double)
     println String.format(Locale.ROOT, 'Effort-adjusted hydration: %.1f L', durationResult.effortConsumption as double)
-    println "Weather data     : ${dynamicResult.weatherMatched ? 'Live Open-Meteo forecast' : 'No forecast data; using static -t/--temp value'}"
+    println "Weather data     : ${dynamicResult.weatherMatched ? 'Open-Meteo, sampled along the route' : 'No weather data; using static -t/--temp value'}"
     println "Moving time (DIN 33466)        : ${formatDuration(dynamicResult.dinDurationHours as double)}"
     println "Moving time (terrain adjusted) : ${formatDuration(dynamicResult.terrainDurationHours as double)}"
     println "Moving time (thermally adj.)   : ${formatDuration(dynamicResult.thermalDurationHours as double)}"
@@ -1797,7 +1837,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     </div>
     <p class="trail-data-note">Solar intensity band along the top of the chart: dark = shade/twilight, amber = partial sun, orange = full sun.</p>
     <p class="trail-data-note">${trailMatched ? 'Trail data: matched to OpenStreetMap (surface/SAC scale available).' : 'Trail data: no OpenStreetMap match (surface/SAC scale unknown).'}</p>
-    <p class="trail-data-note">${dynamicResult.weatherMatched ? 'Weather data: live Open-Meteo forecast.' : 'Weather data: no forecast available (flat static temperature assumed).'}</p>
+    <p class="trail-data-note">${dynamicResult.weatherMatched ? 'Weather data: Open-Meteo, sampled about every 1.5 km along the route.' : 'Weather data: none available (flat static temperature assumed).'}</p>
     <p class="trail-data-note">${breakEvents.isEmpty() ? 'No scheduled rest breaks for this run (see --break).' : "Dashed purple markers show ${breakEvents.size()} scheduled rest break(s) - hover for time and duration."}</p>
     <div id="difficulty-modal" class="modal-overlay" onclick="hideDifficultyInfo()">
         <div class="modal-box" onclick="event.stopPropagation()">
@@ -2398,43 +2438,43 @@ String weatherCacheBaseName = options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, ''
 // cached, since a forecast is provisional and can change between two runs on the same day
 // (or as the target date gets closer) - caching it risks silently acting on a stale forecast.
 File weatherCacheFile = new File(mapsDir, "${weatherCacheBaseName}.weather.${startLocalDate}.json")
-Map weatherData = null
+// About every 1.5 km - roughly 15-20 minutes' walking - matching Open-Meteo's ~10 km model
+// grid closely enough while keeping the multi-location request small.
+List<Map> weatherSamples = weatherSamplePoints(points, 1500.0)
+Map weatherTimeline = null
 
 if (!dateSupported) {
     // Already warned above; no point querying (or trusting a stale cache against) a date
     // Open-Meteo can't actually cover.
 } else if (isPastDate) {
-    Map cachedData = (!options.noCache && weatherCacheFile.exists()) ? new JsonSlurper().parse(weatherCacheFile) as Map : null
-    Map cachedTimeline = cachedData ? parseWeatherTimeline(cachedData) : null
+    Object cachedData = (!options.noCache && weatherCacheFile.exists()) ? new JsonSlurper().parse(weatherCacheFile) : null
+    Map cachedTimeline = cachedData ? parseWeatherTimeline(cachedData, weatherSamples) : null
 
     // Belt-and-braces: the per-date filename already keeps historic caches from colliding,
-    // but only trust it if it actually covers the currently requested date.
+    // but only trust it if it actually covers the currently requested date and samples.
     if (cachedTimeline && timelineCoversDate(cachedTimeline, startLocalDate)) {
-        weatherData = cachedData
+        weatherTimeline = cachedTimeline
         println "Loaded weather data from local cache: maps/${weatherCacheFile.name}"
     } else {
         try {
-            Map centroid = computeCentroid(points)
-            String rawJson = fetchWeatherArchiveRaw(centroid.lat as double, centroid.lon as double, startLocalDate)
+            String rawJson = fetchWeatherArchiveRaw(weatherSamples, startLocalDate)
             weatherCacheFile.text = rawJson
-            weatherData = new JsonSlurper().parseText(rawJson) as Map
-            println 'Fetched and cached weather data from Open-Meteo (Archive API)'
+            weatherTimeline = parseWeatherTimeline(new JsonSlurper().parseText(rawJson), weatherSamples)
+            println "Fetched and cached weather data from Open-Meteo (Archive API, ${weatherSamples.size()} points along the route)"
         } catch (Exception ex) {
             System.err.println("Open-Meteo request failed (${ex.message}); using static -t/--temp value with no solar radiation model.")
         }
     }
 } else {
     try {
-        Map centroid = computeCentroid(points)
-        String rawJson = fetchWeatherForecastRaw(centroid.lat as double, centroid.lon as double)
-        weatherData = new JsonSlurper().parseText(rawJson) as Map
-        println 'Fetched live weather data from Open-Meteo (Forecast API, not cached)'
+        String rawJson = fetchWeatherForecastRaw(weatherSamples)
+        weatherTimeline = parseWeatherTimeline(new JsonSlurper().parseText(rawJson), weatherSamples)
+        println "Fetched live weather data from Open-Meteo (Forecast API, ${weatherSamples.size()} points along the route, not cached)"
     } catch (Exception ex) {
         System.err.println("Open-Meteo request failed (${ex.message}); using static -t/--temp value with no solar radiation model.")
     }
 }
 
-Map weatherTimeline = parseWeatherTimeline(weatherData)
 boolean weatherMatched = weatherTimeline != null
 
 List<Double> smoothedEle = movingAverage(points.collect { it.ele as double }, options.window)
@@ -2523,7 +2563,7 @@ points[0].sunLabel = 'Shade/twilight'
 int gradeRef = 0
 
 if (weatherMatched) {
-    Map startWeather = weatherAtTime(weatherTimeline, startDateTime)
+    Map startWeather = weatherAt(weatherTimeline, 0.0, startDateTime)
     if (startWeather) {
         startTempEncountered = startWeather.temp as double
         peakTempEncountered = startTempEncountered
@@ -2629,14 +2669,14 @@ for (int i = 1; i < points.size(); i++) {
     // break-delayed wall clock this segment is actually reached at (i.e. simulated,
     // pace- and break-dependent), not a single flat assumption for the whole hike.
     LocalDateTime segClock = startDateTime.plusSeconds(Math.round(wallClockElapsedHours * 3600.0))
-    Map segWeather = weatherMatched ? weatherAtTime(weatherTimeline, segClock) : null
+    Map segWeather = weatherMatched ? weatherAt(weatherTimeline, points[i].distance as double, segClock) : null
     double segTemp = segWeather ? segWeather.temp as double : options.tempCelsius
     double segRadiation = segWeather ? segWeather.radiation as double : 0.0
 
     // Shadow clock ignoring break delays, purely to report how much the scheduled breaks
     // shifted the peak temperature encountered - no other effect on the simulation.
     LocalDateTime noBreakClock = startDateTime.plusSeconds(Math.round(totalEffortDurationHours * 3600.0))
-    Map noBreakWeather = weatherMatched ? weatherAtTime(weatherTimeline, noBreakClock) : null
+    Map noBreakWeather = weatherMatched ? weatherAt(weatherTimeline, points[i].distance as double, noBreakClock) : null
     double noBreakTemp = noBreakWeather ? noBreakWeather.temp as double : options.tempCelsius
     peakTempWithoutBreaksEncountered = Math.max(peakTempWithoutBreaksEncountered, noBreakTemp)
 
@@ -2674,7 +2714,7 @@ for (int i = 1; i < points.size(); i++) {
     // more than one break threshold.
     while (breaksEnabled && movingTimeSinceLastBreakHours >= breakIntervalHours) {
         LocalDateTime breakClock = startDateTime.plusSeconds(Math.round(wallClockElapsedHours * 3600.0))
-        Map breakWeather = weatherMatched ? weatherAtTime(weatherTimeline, breakClock) : null
+        Map breakWeather = weatherMatched ? weatherAt(weatherTimeline, points[i].distance as double, breakClock) : null
         double breakTemp = breakWeather ? breakWeather.temp as double : options.tempCelsius
 
         double restingHourlyRate = (0.15 + Math.max(0.0, breakTemp - 15.0) * 0.015) * segExposure

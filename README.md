@@ -368,25 +368,36 @@ gravel rather than pavement.
 ## Dynamic weather & solar exposure
 
 The tool fetches an hourly weather timeline (temperature, direct solar
-radiation, cloud cover) from the free [Open-Meteo](https://open-meteo.com/)
-Forecast or Archive API — no key required — for this route's centroid, and
-simulates walking through it minute by minute from `--date`/`--start-time`
-(default: today, 07:00), rather than assuming one flat temperature for the
-whole hike.
+radiation, cloud cover, humidity, direct normal irradiance and wind) from
+the free [Open-Meteo](https://open-meteo.com/) Forecast or Archive API — no
+key required — at points along the route, and simulates walking through it
+minute by minute from `--date`/`--start-time` (default: today, 07:00),
+rather than assuming one flat temperature for the whole hike.
+
+- **Sampling along the route**: the start, a point about every 1.5 km, and
+  the finish are all fetched in one request (comma-separated latitude,
+  longitude and elevation lists). Each point is sent with its own
+  elevation, so Open-Meteo adjusts the temperature for height rather than
+  using its coarse model grid's terrain; a stage that climbs inland from the
+  coast gets the temperature where each part actually is. Each segment of
+  the simulation uses the nearest sample point. The points are fixed by
+  distance, not by simulated passing time, so the cached response doesn't
+  depend on `--start-time` or pace.
 
 - **Forecast vs Archive**: `--date` today or in the future queries the
   [Forecast API](https://open-meteo.com/en/docs), covering today plus the
   next 16 days in one request; `--date` in the past queries the
   [Archive API](https://open-meteo.com/en/docs/historical-weather-api)
-  instead, for that single day. Both return the same `hourly.time` /
-  `temperature_2m` / `direct_radiation` / `cloud_cover` shape, so the rest
-  of the simulation doesn't need to know which one answered.
+  instead, for that single day. Both return the same hourly shape, so the
+  rest of the simulation doesn't need to know which one answered.
 - **Caching**: only the Archive API is cached, since a past date's weather
   is fixed and permanently reusable. Each historic date gets its own file,
   `maps/<gpxBaseName>.weather.<yyyy-MM-dd>.json` — fetching one historic
   date doesn't evict another you looked up earlier; each stays cached and
   is reused if you come back to it (only if it actually covers the
-  requested `--date`), and `--no-cache` forces a fresh request regardless.
+  requested `--date` and the same sample points, including their
+  elevations, so switching `--elevation` fetches afresh), and `--no-cache`
+  forces a fresh request regardless.
   The Forecast API is **never** cached — a forecast is provisional and can
   change between two runs on the same day, or as the target date gets
   closer, so every run against a today-or-future `--date` fetches live.
