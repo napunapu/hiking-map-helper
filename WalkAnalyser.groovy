@@ -1237,7 +1237,83 @@ for (java.io.File file : options.files) {
     summaries << analyse(file, options)
 }
 
+// Pools the heart-rate-by-gradient curves of several walks into one personal cost curve, each
+// walk's bands relative to its own near-flat walking and weighted by distance. Bands with less
+// than a kilometre in total are left out as too noisy. Then fits how net heartbeats per
+// kilometre of that curve's cost rise with each walk's mean air temperature along the route.
+Map pooledEffortCurve(List<Map> summaries) {
+    Map<String, double[]> pooled = [:]
+    Map<String, Map> meta = [:]
+    summaries.findAll { it.hrByGradient }.each { s ->
+        ((s.hrByGradient as Map).rows as List<Map>).each { row ->
+            if (!Double.isNaN(row.relative as double)) {
+                double[] acc = pooled.computeIfAbsent(row.label as String) { new double[2] }
+                acc[0] += row.km as double
+                acc[1] += (row.km as double) * (row.relative as double)
+                meta[row.label as String] = row
+            }
+        }
+    }
+    List<Double> edges = [0.0] + GRADIENT_BAND_EDGES_PCT + [40.0]
+    List<Map> anchors = pooled.findAll { label, acc -> acc[0] >= 1.0 }.collect { label, acc ->
+        Map row = meta[label]
+        int b = row.bandIndex as int
+        double mid = (edges[b] + edges[b + 1]) / 2.0 * ((row.climb as boolean) ? 1 : -1)
+        [label: label, gradePct: mid, km: acc[0], factor: acc[1] / acc[0]]
+    }.sort { it.gradePct as double }
+    Closure<Double> factorFor = { String label -> pooled[label] && pooled[label][0] >= 1.0 ? pooled[label][1] / pooled[label][0] : Double.NaN }
+
+    // Heat: net heartbeats per kilometre of curve cost against mean air temperature.
+    List<double[]> points = []
+    summaries.findAll { it.hrByGradient && it.meanTemp != null && it.netBeats != null }.each { s ->
+        double costKm = 0.0
+        double coveredKm = 0.0
+        ((s.hrByGradient as Map).rows as List<Map>).each { row ->
+            double f = factorFor(row.label as String)
+            if (!Double.isNaN(f)) {
+                costKm += (row.km as double) * f
+                coveredKm += row.km as double
+            }
+        }
+        if (costKm > 0) {
+            // Scale the cost to the whole walk: bands left out as too noisy are a tiny share.
+            double movingKm = ((s.hrByGradient as Map).rows as List<Map>).sum { it.km as double } as double
+            points << ([s.meanTemp as double, (s.netBeats as double) / (costKm * movingKm / coveredKm)] as double[])
+        }
+    }
+    Map heat = null
+    if (points.size() >= 3) {
+        double mx = points.sum { it[0] } / points.size()
+        double my = points.sum { it[1] } / points.size()
+        double sxy = points.sum { (it[0] - mx) * (it[1] - my) } as double
+        double sxx = points.sum { (it[0] - mx) * (it[0] - mx) } as double
+        double slope = sxy / sxx
+        double intercept = my - slope * mx
+        double at20 = intercept + slope * 20.0
+        heat = [slope: slope, intercept: intercept, pctPerDegAt20: slope / at20 * 100.0, walks: points.size(),
+                minTemp: points.min { it[0] }[0], maxTemp: points.max { it[0] }[0]]
+    }
+    [anchors: anchors, heat: heat]
+}
+
 if (summaries.size() > 1) {
+    Map curve = pooledEffortCurve(summaries)
+    if (curve.anchors) {
+        println ''
+        println "=== Personal effort curve from ${summaries.count { it.hrByGradient }} walks ==="
+        println 'Net heartbeats per km relative to near-flat walking, pooled by distance (bands under 1 km left out):'
+        println '  Gradient  mid %      km  factor  Minetti 2002'
+        (curve.anchors as List<Map>).each { a ->
+            println String.format(Locale.ROOT, '  %-8s %6.1f  %6.1f   %5.2f       %5.2f', a.label, a.gradePct as double, a.km as double, a.factor as double, minettiWalkingRelative((a.gradePct as double) / 100.0))
+        }
+        println 'As anchors [grade %, factor]: ' + (curve.anchors as List<Map>).collect { String.format(Locale.ROOT, '[%.1f, %.2f]', it.gradePct as double, it.factor as double) }.join(', ')
+        if (curve.heat) {
+            Map h = curve.heat as Map
+            println String.format(Locale.ROOT, 'Heat: net heartbeats per km of that cost rise %.1f%% per degC of mean air temperature (relative to 20 degC; %d walks, %.0f-%.0f degC)',
+                h.pctPerDegAt20 as double, h.walks as int, h.minTemp as double, h.maxTemp as double)
+        }
+    }
+
     println ''
     println '=== All walks ==='
     println 'Date        km   up(m) down(m) steep up/down  moving   avg HR  net beats  beats/km   kcal  load  effort  air degC  sun UTCI'
