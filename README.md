@@ -586,7 +586,7 @@ A fourth clickable tile, "Flat equivalent", expresses terrain and technical
 difficulty as a distance in kilometres — how far this route is worth on flat
 pavement — rather than an abstract 0-100 score, matching how tools like
 HealthFit/Strava's grade-adjusted pace present the same idea. It separates
-*metabolic* cost (how tiring) from *biomechanical* cost (how jarring):
+how tiring a route is from how jarring it is:
 
 - **Terrain factor (eta)**: how much harder a surface is to move over than
   firm pavement, resolved through the five-tier fallback hierarchy
@@ -597,23 +597,33 @@ HealthFit/Strava's grade-adjusted pace present the same idea. It separates
 - **Technical factor**: from the OSM `sac_scale` tag — 1.0 for
   hiking/T1/none, 1.15 for mountain_hiking/T2, 1.35 for
   demanding_mountain_hiking/T3, 1.6 for alpine_hiking/T4 and above.
-- **Flat cardio equivalent**: [Minetti's polynomial approximation](https://en.wikipedia.org/wiki/Locomotion_energetics)
-  of energy cost per unit distance as a function of gradient, normalised so
-  flat pavement costs exactly `1.0` ("as costly as walking flat ground"),
-  then scaled by the terrain and technical factors, summed and divided by
-  1000. This is the aerobic/caloric equivalent distance on flat asphalt —
-  how far this route "counts as" for cardio purposes.
-- **Downhill impact surcharge**: on any segment steeper than -10%, an
-  additional `(|grade| / 10%)²` penalty (also scaled by terrain/technical
-  factor), summed and divided by 1000 to express it in the same km units.
-  This models the extra quad/knee eccentric-braking load from a steep
-  descent — it grows quickly, since braking strain compounds with both
-  steepness and rough footing — and is reported as a surcharge *on top of*
-  the flat cardio equivalent, not folded invisibly into one number.
-- **Total flat equivalent**: `flat cardio equivalent + downhill impact
-  surcharge`, with an **effort multiplier** (`total / actual distance`) —
-  e.g. a 20 km route with a 1.45x multiplier is worth 29 km of flat walking
-  for pacing, nutrition and recovery planning.
+- **Cost by gradient**: effort per unit distance relative to near-flat
+  walking, from a piecewise-linear curve calibrated against recorded heart
+  rate: net heartbeats above resting per km in each gradient band, pooled
+  over 10 recorded GR92 walks (about 190 km) by `WalkAnalyser.groovy` (see
+  "Analysing recorded walks" above). Climbs follow Minetti's (2002)
+  laboratory cost of walking closely, somewhat less steeply above 15%
+  (2.9x flat at 20-30% against Minetti's 3.8x); gentle descents cost a
+  little less than flat walking (about 0.9x), but descents steeper than 15%
+  cost more (1.1-1.5x), since they are walked slowly, where Minetti's
+  treadmill figures fall to 0.4-0.6x. Beyond ±25% the factor holds flat.
+- **Flat equivalent**: that cost, scaled by the terrain and technical
+  factors and summed over the route, with an **effort multiplier**
+  (`flat equivalent / actual distance`) — e.g. a 20 km route with a 1.45x
+  multiplier is worth 29 km of flat walking for pacing, nutrition and
+  recovery planning. On the recorded walks it predicted each walk's net
+  heartbeats to within about 10% once heat is allowed for.
+- **In the heat**: the same figure with each segment scaled by the simulated
+  air temperature, +3% per °C above 20 °C (and less below it, held flat
+  outside 15-35 °C): the same route took that many more heartbeats on hot
+  days, while walking pace showed no link to heat.
+- **Downhill braking load**: on any segment steeper than -10%, a
+  `(|grade| / 10%)²` index (also scaled by the terrain and technical
+  factors), summed and divided by 1000. It indicates the quad and knee
+  eccentric-braking strain of steep, rough descents, and is reported
+  separately rather than added to the flat equivalent: the heart-rate curve
+  already includes what descents cost, and adding the surcharge on top made
+  the total the worst predictor of recorded heartbeats of the models tried.
 
 The tile's popup also lists the surface breakdown by % of distance, and the
 high-strain rough descent distance (descents steeper than -15% on a rough or
@@ -630,7 +640,7 @@ The HTML file contains a self-contained, responsive SVG elevation profile:
     (red).
   - **Relative effort factor**: the combined metabolic + braking load at
     each point, expressed as an instantaneous flat-equivalent multiplier
-    (`local_minetti_mult * eta * T-factor + local_braking_penalty`), from
+    (`local_effort_cost * eta * T-factor + local_braking_penalty`), from
     low (cyan) through flat-equivalent (green, ~1.0x) and moderate (yellow)
     to high/extreme (orange/dark red, 2.5x+) — this can highlight rough,
     technical descents that a pure-gradient view would just show as

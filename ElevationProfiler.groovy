@@ -1270,7 +1270,7 @@ Map resolveSurfaceAndEta(double plat, double plon, Map tags, List<Map> landcover
 
 // Speed-model terrain factor: a separate, empirically calibrated multiplier used only by the
 // effort-adjusted duration model (see slopeSpeedFactor below), not by the Flat Equivalent
-// Distance model (flat cardio/downhill impact km). RouteCalibrator.groovy measured real
+// Distance model (flat equivalent/downhill braking load). RouteCalibrator.groovy measured real
 // hikers' actual pace against a recorded GR92 track and found surface roughness costs far
 // less real-world pace than the flat-equivalent model's eta assumes; that scale is left
 // untouched above since the flat-equivalent model's high-strain-descent and mechanical-
@@ -1298,14 +1298,44 @@ double technicalFactorForSacScale(String sacScale) {
     1.0
 }
 
-// Minetti's polynomial approximation of metabolic cost per unit distance, as a function of
-// gradient (a fraction, not a percentage), normalised so flat ground (i = 0) costs exactly
-// 1.0 - i.e. "1.0x" means "as costly as walking flat pavement". Clamped at 0.5 since even a
-// gentle descent still costs some minimum effort to keep moving.
-double minettiCostMultiplier(double gradeFraction) {
-    double i = gradeFraction
-    double cw = 280.5 * Math.pow(i, 5) - 58.7 * Math.pow(i, 4) - 268.3 * Math.pow(i, 3) + 95.8 * Math.pow(i, 2) + 4.13 * i + 3.6
-    Math.max(0.5, cw / 3.6)
+// Effort cost per unit distance as a function of gradient (a fraction, not a percentage),
+// relative to near-flat walking - "1.0x" means "as costly as walking flat ground". Calibrated
+// from heart rate rather than taken from theory: WalkAnalyser.groovy's personal effort curve,
+// net heartbeats above resting per km by gradient band, pooled over 10 recorded GR92 walks
+// (about 190 km). Climbs follow Minetti et al. (2002) closely, somewhat less steeply above 15%;
+// steep descents cost more per km than flat walking, unlike Minetti's treadmill figures,
+// since they are walked slowly. Anchors sit at band midpoints; beyond the outermost (steeper
+// than +25% or -25%) the factor holds flat, since there is too little data past them.
+double effortCostMultiplier(double gradeFraction) {
+    List<List<Double>> anchors = [
+        [-25.0, 1.52], [-17.5, 1.14], [-12.5, 0.94], [-7.5, 0.88], [-2.5, 0.90],
+        [2.5, 1.09], [7.5, 1.47], [12.5, 1.97], [17.5, 2.43], [25.0, 2.91]
+    ]
+    double gradePct = gradeFraction * 100.0
+    if (gradePct <= anchors[0][0]) {
+        return anchors[0][1]
+    }
+    if (gradePct >= anchors[-1][0]) {
+        return anchors[-1][1]
+    }
+    for (int i = 1; i < anchors.size(); i++) {
+        double g1 = anchors[i][0]
+        if (gradePct <= g1) {
+            double g0 = anchors[i - 1][0]
+            double f0 = anchors[i - 1][1]
+            double f1 = anchors[i][1]
+            return f0 + (f1 - f0) * (gradePct - g0) / (g1 - g0)
+        }
+    }
+    anchors[-1][1]
+}
+
+// Heat raises the effort of the same route: across the same 10 recorded walks, net heartbeats
+// per km of effortCostMultiplier's cost rose about 3% per degC of mean air temperature along
+// the route (17-32 degC), while walking pace showed no link to heat at all. Relative to 20 degC,
+// and held flat outside 15-35 degC, beyond the data.
+double heatEffortFactor(double airTemp) {
+    1.0 + 0.03 * (Math.max(15.0, Math.min(35.0, airTemp)) - 20.0)
 }
 
 String strainColour(double intensity) {
@@ -1564,14 +1594,15 @@ Map waterIntakeRecommendation(double durationHours, double tempCelsius, double e
 // Flat Equivalent Distance model: expresses metabolic and mechanical load as km of flat,
 // paved walking - a HealthFit/Strava-style grade-adjusted-pace figure - rather than an
 // abstract 0-100 score with no physical meaning of its own.
-Map trailStrainSummary(double flatCardioKm, double actualDistanceKm, double brakingIndexRaw, double highStrainDescentKm, Map<String, Double> surfaceDistanceM, double totalDistanceM) {
+Map trailStrainSummary(double flatCardioKm, double heatAdjustedKm, double meanAirTemp, double actualDistanceKm, double brakingIndexRaw, double highStrainDescentKm, Map<String, Double> surfaceDistanceM, double totalDistanceM) {
     // The raw braking index accumulates in metres (distance_m * (|grade| / 0.10)^2 * eta *
-    // T-factor per segment), so dividing by 1000 expresses it as km, on the same footing as
-    // flatCardioKm.
+    // T-factor per segment), so dividing by 1000 expresses it in km. It is reported alongside
+    // the flat equivalent but no longer added to it: the heart-rate-calibrated cost curve
+    // already includes what steep descents cost, and adding the surcharge on top made the total
+    // the worst predictor of recorded heartbeats of the models tried.
     double downhillImpactKm = brakingIndexRaw / 1000.0
-    double totalEffortKm = flatCardioKm + downhillImpactKm
+    double totalEffortKm = flatCardioKm
     double effortMultiplier = actualDistanceKm > 0 ? totalEffortKm / actualDistanceKm : 1.0
-    double aerobicDemandPct = actualDistanceKm > 0 ? ((flatCardioKm / actualDistanceKm) - 1.0) * 100.0 : 0.0
 
     List<Map> surfaceBreakdown = totalDistanceM > 0
         ? surfaceDistanceM.collect { surface, distM -> [surface: surface, pct: (distM / totalDistanceM) * 100.0] }.sort { -it.pct }
@@ -1579,19 +1610,21 @@ Map trailStrainSummary(double flatCardioKm, double actualDistanceKm, double brak
 
     String reason = String.format(
         Locale.ROOT,
-        'Flat cardio equivalent is %.1f km - the aerobic/caloric cost of this %.1f km route if it were ' +
-        'entirely flat pavement (+%.0f%% over the actual distance), similar to a grade-adjusted pace. ' +
-        'Downhill impact surcharge adds a further %.1f km, the mechanical quad/knee braking load from ' +
-        'descents steeper than -10%%, weighted by surface roughness (%.1f km of that is on rough or loose ' +
-        'ground steeper than -15%%, the most jarring combination). Combined, the total flat equivalent is ' +
-        '%.1f km (%.2fx actual distance) - a practical planning figure for pacing, nutrition and recovery.',
-        flatCardioKm, actualDistanceKm, aerobicDemandPct, downhillImpactKm, highStrainDescentKm,
-        totalEffortKm, effortMultiplier
+        'Flat equivalent is %.1f km - the effort of this %.1f km route if it were entirely flat pavement ' +
+        '(%.2fx the actual distance), from a cost-by-gradient curve calibrated against recorded heart rate ' +
+        'and the surface and technical factors. In the simulated weather (mean %.0f degC while walking) ' +
+        'it is worth %.1f km, since heat raises the effort of the same route by about 3%% per degC ' +
+        'relative to 20 degC. Separately, the downhill braking load of descents steeper than -10%% is ' +
+        '%.1f km-equivalent, weighted by surface roughness (%.1f km of rough or loose ground steeper than ' +
+        '-15%%, the most jarring combination) - a knee and quad strain indicator, not part of the total.',
+        flatCardioKm, actualDistanceKm, effortMultiplier, meanAirTemp, heatAdjustedKm, downhillImpactKm,
+        highStrainDescentKm
     )
 
     [
-        flatCardioKm: flatCardioKm, actualDistanceKm: actualDistanceKm, downhillImpactKm: downhillImpactKm,
-        totalEffortKm: totalEffortKm, effortMultiplier: effortMultiplier, aerobicDemandPct: aerobicDemandPct,
+        flatCardioKm: flatCardioKm, heatAdjustedKm: heatAdjustedKm, meanAirTemp: meanAirTemp,
+        actualDistanceKm: actualDistanceKm, downhillImpactKm: downhillImpactKm,
+        totalEffortKm: totalEffortKm, effortMultiplier: effortMultiplier,
         highStrainDescentKm: highStrainDescentKm, surfaceBreakdown: surfaceBreakdown, reason: reason
     ]
 }
@@ -1687,9 +1720,9 @@ void printSummary(double distanceKm, double ascent, double descent, double durat
     println 'DISTANCE & EFFORT EQUIVALENTS'
     println strainDivider
     println String.format(Locale.ROOT, 'Actual trail distance:       %.1f km', trailStrain.actualDistanceKm as double)
-    println String.format(Locale.ROOT, 'Flat cardio equivalent:      %.1f km (+%.0f%% aerobic demand)', trailStrain.flatCardioKm as double, trailStrain.aerobicDemandPct as double)
-    println String.format(Locale.ROOT, 'Downhill impact surcharge:   +%.1f km (eccentric braking load)', trailStrain.downhillImpactKm as double)
-    println String.format(Locale.ROOT, 'Total flat equivalent:       %.1f km (%.2fx flat walking)', trailStrain.totalEffortKm as double, trailStrain.effortMultiplier as double)
+    println String.format(Locale.ROOT, 'Flat equivalent:             %.1f km (%.2fx flat walking)', trailStrain.totalEffortKm as double, trailStrain.effortMultiplier as double)
+    println String.format(Locale.ROOT, 'In the simulated heat:       %.1f km (mean %.0f degC while walking)', trailStrain.heatAdjustedKm as double, trailStrain.meanAirTemp as double)
+    println String.format(Locale.ROOT, 'Downhill braking load:       %.1f km-equivalent (separate, not in the total)', trailStrain.downhillImpactKm as double)
     println String.format(Locale.ROOT, 'High-strain rough descent:   %.1f km (< -15%% on unpaved ground)', trailStrain.highStrainDescentKm as double)
     println strainDivider
     println 'Surface breakdown    :'
@@ -1831,10 +1864,11 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     double smoothSteepDescentKm = (descentStrain.smoothSteepDescentDistanceM as double) / 1000.0
     double roughSteepDescentKm = (descentStrain.roughSteepDescentDistanceM as double) / 1000.0
     double flatCardioKm = trailStrain.flatCardioKm as double
+    double heatAdjustedKm = trailStrain.heatAdjustedKm as double
+    double meanAirTemp = trailStrain.meanAirTemp as double
     double downhillImpactKm = trailStrain.downhillImpactKm as double
     double totalEffortKm = trailStrain.totalEffortKm as double
     double effortMultiplier = trailStrain.effortMultiplier as double
-    double aerobicDemandPct = trailStrain.aerobicDemandPct as double
     double highStrainDescentKm = trailStrain.highStrainDescentKm as double
     String trailStrainReason = trailStrain.reason
     List<Map> surfaceBreakdown = trailStrain.surfaceBreakdown as List<Map>
@@ -2153,7 +2187,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         <div>
             <span>Flat equivalent</span>
             <strong class="clickable" onclick="showTrailStrainInfo()">${String.format(Locale.ROOT, '%.1f km flat equiv (%.2fx)', totalEffortKm, effortMultiplier)} &#9432;</strong>
-            <div class="tile-badge">Cardio: ${String.format(Locale.ROOT, '%.1f km', flatCardioKm)} | Braking: +${String.format(Locale.ROOT, '%.1f km', downhillImpactKm)}</div>
+            <div class="tile-badge">In the heat: ${String.format(Locale.ROOT, '%.1f km', heatAdjustedKm)} | Braking load: ${String.format(Locale.ROOT, '%.1f km', downhillImpactKm)}</div>
         </div>
         <div>
             <span>Ascent</span>
@@ -2352,22 +2386,24 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             <h2>Flat equivalent distance</h2>
             <p>${escapeXml(trailStrainReason)}</p>
             <p style="font-size: 12px; color: #666;">
-                <strong>Flat cardio equivalent</strong> is the aerobic/caloric equivalent distance
-                on flat asphalt (matching a HealthFit/Strava grade-adjusted-pace style figure) -
-                it accounts for climbing, descending and surface roughness, but not braking.
-                <strong>Downhill impact surcharge</strong> is the extra mechanical joint and
-                muscular cost of braking on slopes steeper than -10%, weighted by how rough the
-                surface underfoot is - two descents of the same steepness can load your knees very
-                differently depending on footing. <strong>Total flat equivalent</strong> combines
-                both into one number: the overall fatigue this route is worth, for planning
-                nutrition, pacing and recovery as if it were that many km of flat walking.
+                <strong>Flat equivalent</strong> is how far this route is worth on flat pavement,
+                for planning nutrition, pacing and recovery. Its cost by gradient is calibrated
+                against recorded heart rate (net heartbeats above resting per km) on GR92 walks:
+                climbs cost roughly what lab measurements predict, and steep descents cost more
+                per km than flat walking, since they are walked slowly. Surface roughness and SAC
+                scale scale it further. <strong>In the heat</strong> adds the effect of the
+                simulated air temperature: the same route took about 3% more heartbeats per degC
+                above 20&deg;C (and less below it). <strong>Downhill braking load</strong> is the
+                separate mechanical joint and muscular strain of braking on slopes steeper than
+                -10%, weighted by how rough the surface underfoot is - a knee and quad indicator,
+                not added to the flat equivalent.
             </p>
             <table>
                 <tr><th>Metric</th><th>This route</th></tr>
                 <tr><td>Actual distance</td><td>${String.format(Locale.ROOT, '%.2f km', distanceKm)}</td></tr>
-                <tr><td>Flat cardio equivalent</td><td>${String.format(Locale.ROOT, '%.2f km', flatCardioKm)}</td></tr>
-                <tr><td>Downhill impact surcharge</td><td>+${String.format(Locale.ROOT, '%.2f km', downhillImpactKm)}</td></tr>
-                <tr><td><strong>Total flat equivalent</strong></td><td><strong>${String.format(Locale.ROOT, '%.2f km (%.2fx)', totalEffortKm, effortMultiplier)}</strong></td></tr>
+                <tr><td><strong>Flat equivalent</strong></td><td><strong>${String.format(Locale.ROOT, '%.2f km (%.2fx)', totalEffortKm, effortMultiplier)}</strong></td></tr>
+                <tr><td>In the simulated heat (mean ${String.format(Locale.ROOT, '%.0f', meanAirTemp)}&deg;C)</td><td>${String.format(Locale.ROOT, '%.2f km', heatAdjustedKm)}</td></tr>
+                <tr><td>Downhill braking load (separate)</td><td>${String.format(Locale.ROOT, '%.2f km', downhillImpactKm)}</td></tr>
                 <tr><td>High-strain rough descent</td><td>${String.format(Locale.ROOT, '%.2f km', highStrainDescentKm)}</td></tr>
                 <tr><th colspan="2">Surface breakdown (% of distance)</th></tr>
                 ${surfaceBreakdown.collect { entry -> "<tr><td>${escapeXml(entry.surface as String)}</td><td>${String.format(Locale.ROOT, '%.1f%%', entry.pct as double)}</td></tr>" }.join('\n                ')}
@@ -2949,6 +2985,8 @@ double smoothSteepDescentDistanceM = 0.0
 double roughSteepDescentDistanceM = 0.0
 double totalMetabolicCostM = 0.0
 double totalBrakingIndex = 0.0
+double totalHeatEffortM = 0.0
+double heatTempHours = 0.0
 double highStrainDescentDistanceM = 0.0
 double totalTerrainDurationHours = 0.0
 double totalEffortDurationHours = 0.0
@@ -3053,14 +3091,14 @@ for (int i = 1; i < points.size(); i++) {
     }
     surfaceDistanceM[surface] = (surfaceDistanceM[surface] ?: 0.0) + segDist
 
-    // Multi-factor trail strain model: metabolic cost (Minetti) and eccentric braking
+    // Multi-factor trail strain model: effort cost (heart-rate calibrated) and eccentric braking
     // strain, each scaled by the terrain factor (eta) and technical factor (T-factor) at
     // this point. Grade is stored as a percentage elsewhere, so it is converted to a
     // fraction here to match the model's expected units.
     double tFactor = points[i].tFactor as double
     double gradeFraction = grade / 100.0
 
-    double gradeMult = minettiCostMultiplier(gradeFraction)
+    double gradeMult = effortCostMultiplier(gradeFraction)
     double metabolicCost = segDist * gradeMult * eta * tFactor
     totalMetabolicCostM += metabolicCost
 
@@ -3094,6 +3132,7 @@ for (int i = 1; i < points.size(); i++) {
     Map segWeather = weatherMatched ? weatherAt(weatherTimeline, points[i].distance as double, segClock) : null
     double segTemp = segWeather ? segWeather.temp as double : options.tempCelsius
     double segRadiation = segWeather ? segWeather.radiation as double : 0.0
+    totalHeatEffortM += metabolicCost * heatEffortFactor(segTemp)
 
     // Shadow clock ignoring break delays, purely to report how much the scheduled breaks
     // shifted the peak temperature encountered - no other effect on the simulation.
@@ -3143,6 +3182,7 @@ for (int i = 1; i < points.size(); i++) {
     }
 
     totalTerrainDurationHours += segDistKm / vSegEffort
+    heatTempHours += segTemp * tSegHours
     totalEffortDurationHours += tSegHours
     wallClockElapsedHours += tSegHours
     movingTimeSinceLastBreakHours += tSegHours
@@ -3204,7 +3244,8 @@ double durationHours = din33466Duration(totalDistanceKm, totalAscent, totalDesce
 Map difficultyResult = classifyDifficulty(totalAscent, totalDistanceKm, maxGrade, clampedGradeCount)
 Map shenandoahResult = shenandoahDifficulty(totalAscent, totalDistanceKm)
 Map waterResult = waterIntakeRecommendation(durationHours, options.tempCelsius, options.exposureFactor)
-Map trailStrain = trailStrainSummary(totalMetabolicCostM / 1000.0, totalDistanceKm, totalBrakingIndex, highStrainDescentDistanceM / 1000.0, surfaceDistanceM, cumulative)
+double meanAirTemp = totalEffortDurationHours > 0 ? heatTempHours / totalEffortDurationHours : options.tempCelsius
+Map trailStrain = trailStrainSummary(totalMetabolicCostM / 1000.0, totalHeatEffortM / 1000.0, meanAirTemp, totalDistanceKm, totalBrakingIndex, highStrainDescentDistanceM / 1000.0, surfaceDistanceM, cumulative)
 Map durationResult = durationComparison(durationHours, totalEffortDurationHours, totalDistanceKm, waterResult.activeHourlyRate as double, options.speedKmh)
 Map dynamicResult = dynamicWeatherSummary(
     startDateTime, durationHours, totalTerrainDurationHours, totalEffortDurationHours,

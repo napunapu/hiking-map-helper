@@ -53,18 +53,6 @@ rate. `RouteCalibrator.groovy` still takes a recorded GPX and computes
 distance from GPS positions; giving it the same FIT loading would let
 calibration use the watch's distance and the corrected altitude.
 
-## Use heart rate to recalibrate the flat equivalent model
-
-On 10 recorded walks, net heartbeats per km by gradient followed Minetti
-(2002) on climbs, but steep descents cost 1.1-1.5x flat rather than
-Minetti's 0.4-0.6x, while `minettiCostMultiplier`'s current polynomial
-(not Minetti's) gives 2-6x there and too little on climbs. Total flat
-equivalent as coded predicted per-walk heartbeats worst of the models
-tried; Minetti's curve without the braking surcharge did best, within
-about 10% once heartbeats are adjusted for heat (about +3% per degC).
-A heart-rate-calibrated cost curve could replace both the polynomial and
-the surcharge.
-
 ## Decide on the thermal pace penalty
 
 Against 10 recorded walks (stage 19 excluded as a deliberate all-out
@@ -83,4 +71,3 @@ check on the heart-rate and flat equivalent figures, and it would flag
 walks to treat as outliers (like the all-out 15 September walk). One
 option is a plain-text or Markdown note next to each FIT file with the
 same name, kept under the gitignored `gpx/real_world/` with the walks.
-
