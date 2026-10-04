@@ -501,6 +501,14 @@ rather than assuming one flat temperature for the whole hike.
   combines air temperature with radiant heat load; pace scales down by
   0.8% per degree above 15°C effective heat, floored at 65% of normal
   speed, feeding directly into the "OSM Terrain & Grade Adjusted" duration.
+  This is a rough general figure meant for an average walker, not one
+  calibrated on recorded walks, and it is kept deliberately: a less fit or
+  unacclimatised walker has less heart-rate headroom and tends to slow down
+  in heat. A fit walker may not. On 10 recorded GR92 walks by a fit walker,
+  pace showed no link to heat (heart rate rose instead, about 3% per °C),
+  so the "terrain adjusted" moving time matched their recordings within
+  about 1% on average, while the thermally adjusted figure read about 9%
+  long.
 - **Dynamic hydration**: each segment's water need scales with its own
   local temperature and exposure factor, then sums across the whole route
   (plus a fixed 0.5 L reserve) — shown alongside the flat static estimate
@@ -537,9 +545,8 @@ The UTCI uses the published 6th-order polynomial approximation (Bröde et
 al. 2012), and SolarCal follows ASHRAE 55; both are ported from
 [pythermalcomfort](https://github.com/CenterForTheBuiltEnvironment/pythermalcomfort)
 (MIT licence) and match it to within 0.00001 °C. This is a readout only:
-it doesn't change the duration or water estimates, since a check against
-11 recorded walks found no link between heat and walking pace (see the
-thermal pace penalty above).
+it doesn't change the duration or water estimates; the duration's heat
+effect comes from the thermal pace penalty above.
 
 ## Scheduled rest breaks
 

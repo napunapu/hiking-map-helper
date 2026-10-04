@@ -53,14 +53,6 @@ rate. `RouteCalibrator.groovy` still takes a recorded GPX and computes
 distance from GPS positions; giving it the same FIT loading would let
 calibration use the watch's distance and the corrected altitude.
 
-## Decide on the thermal pace penalty
-
-Against 10 recorded walks (stage 19 excluded as a deliberate all-out
-effort), the thermal pace penalty made moving-time predictions worse (mean
-+9% against +1% without it), and neither peak air temperature nor full-sun
-felt heat (UTCI) along the route correlated with actual pace (r = 0.00 and
-0.01). Removing or weakening it is pending a decision.
-
 ## Notes on how each walk felt
 
 For every recorded walk with FIT and GPX files, keep a short note (a
