@@ -44,3 +44,22 @@ same calibrated eta as ordinary dirt/gravel in the speed model. Running the
 calibrator against a recorded track that covers genuinely rough or loose
 terrain would let severe-loose surfaces be calibrated distinctly instead of
 inheriting a value derived mostly from firmer trail.
+
+## Recorded-walk analysis in Groovy
+
+The recorded-walk side of the separate Python project (`GR92 actual`:
+Apple Watch FIT/GPX loading, the barometer start correction against the
+terrain model, gradient bands on recorded altitude) could move into
+`RouteCalibrator.groovy`, so calibration uses full-precision GPX altitude
+(FIT rounds to 0.2 m steps) and corrects the barometer's start error. The
+Garmin FIT SDK is on Maven Central (`com.garmin:fit`), so `@Grab` works;
+the heart rate in the FIT files would be the right way to test the flat
+equivalent distance model, which moving time can't validate.
+
+## Decide on the thermal pace penalty
+
+Against 10 recorded walks (stage 19 excluded as a deliberate all-out
+effort), the thermal pace penalty made moving-time predictions worse (mean
++9% against +1% without it), and neither peak air temperature nor full-sun
+felt heat (UTCI) along the route correlated with actual pace (r = 0.00 and
+0.01). Removing or weakening it is pending a decision.
