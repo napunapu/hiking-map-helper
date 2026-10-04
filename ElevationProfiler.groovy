@@ -956,7 +956,7 @@ List<Double> movingAverage(List<Double> values, int windowSize) {
 
 double din33466Duration(double distanceKm, double ascentM, double descentM) {
     double horizontalHours = distanceKm / 4.0
-    double verticalHours = (ascentM / 400.0) + (descentM / 800.0)
+    double verticalHours = (ascentM / 300.0) + (descentM / 500.0)
     double larger = Math.max(horizontalHours, verticalHours)
     double smaller = Math.min(horizontalHours, verticalHours)
     larger + (smaller / 2.0)
@@ -1008,7 +1008,7 @@ Map durationComparison(double dinDurationHours, double effortDurationHours, doub
         Locale.ROOT,
         'The effort-adjusted model integrates a per-segment speed derived from Tobler\'s hiking ' +
         'function (slowing for both steep climbs and steep descents, rather than assuming a fixed ' +
-        '800 m/h descent rate), divided by the terrain factor (eta) and technical factor (T-factor) ' +
+        '500 m/h descent rate), divided by the terrain factor (eta) and technical factor (T-factor) ' +
         'at each point from the matched OpenStreetMap surface and SAC scale, then further slowed by ' +
         'a thermal pace penalty from the simulated ambient temperature and solar radiation at the ' +
         'time each segment is reached. Rough, technical or hot, sun-exposed sections are explicitly ' +

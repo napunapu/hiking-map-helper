@@ -126,10 +126,12 @@ Two independent duration estimates are shown side by side, since they model
 moving time very differently:
 
 1. **Standard DIN 33466** — the fixed hiking-time standard (4 km/h
-   horizontal, 400 m/h ascent, 800 m/h descent; the larger of the
+   horizontal, 300 m/h ascent, 500 m/h descent; the larger of the
    horizontal/vertical time plus half of the smaller). Always uses the
    standard 4 km/h regardless of `-s`/`--speed`, since it's a fixed
-   reference formula, not a tunable model.
+   reference formula, not a tunable model. The 400 m/h ascent and 800 m/h
+   descent rates sometimes quoted for it are the Swiss Alpine Club's (SAC)
+   rule, not DIN 33466.
 2. **OSM Terrain & Grade Adjusted** — integrates a walking speed per
    segment: `v_seg = base_speed * slope_factor / (eta * T-factor)`, where
    `slope_factor` and `eta` are both **empirically calibrated** against a
@@ -153,7 +155,7 @@ moving time very differently:
      tuned against it, and recalibrating it against pace data would
      silently flatten its terrain sensitivity too.
 
-   Unlike DIN's fixed 800 m/h descent rate, this explicitly varies pace
+   Unlike DIN's fixed 500 m/h descent rate, this explicitly varies pace
    with rough or technical terrain rather than assuming descending is
    always fast. `base_speed` defaults to 4.59 km/h (also calibrated) and
    is configurable via `-s`/`--speed`. This speed is then further reduced

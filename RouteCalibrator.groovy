@@ -216,7 +216,7 @@ Map nearestWayInfo(double plat, double plon, List<Map> ways, double thresholdM) 
 
 double din33466Duration(double distanceKm, double ascentM, double descentM) {
     double horizontalHours = distanceKm / 4.0
-    double verticalHours = (ascentM / 400.0) + (descentM / 800.0)
+    double verticalHours = (ascentM / 300.0) + (descentM / 500.0)
     double larger = Math.max(horizontalHours, verticalHours)
     double smaller = Math.min(horizontalHours, verticalHours)
     larger + (smaller / 2.0)
