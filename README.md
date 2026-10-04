@@ -437,6 +437,40 @@ rather than assuming one flat temperature for the whole hike.
   in the console output and the Duration popup. This active-moving total is
   reported separately from break/resting consumption — see below.
 
+## Felt heat in shade and in full sun
+
+Air temperature is always measured in shade; in the sun the body also
+absorbs radiant heat. For every segment of the simulated walk, the tool
+computes the UTCI (Universal Thermal Climate Index), a "feels like"
+temperature in °C combining air temperature, humidity, wind and radiation,
+twice:
+
+- **In shade**: the surroundings radiate at air temperature.
+- **In full sun**: a standing walker under open sky, fully exposed, with the
+  sun's radiant gain from the ASHRAE 55 SolarCal model, averaged over the
+  sun's direction relative to the body. Inputs are Open-Meteo's direct
+  normal irradiance and the sun's height, calculated from time and
+  position; skin and clothing absorb 70% of sunlight and the ground
+  reflects 25%.
+
+A moment counts as sunny when direct sun is at least 120 W/m² (the WMO
+definition of sunshine). The console and the "Felt heat in full sun" tile
+report the share of moving time in sunshine, the mean felt temperature in
+shade and in full sun while sunny, and the full-sun peak with its time and
+UTCI heat-stress category (moderate 26-32 °C, strong 32-38 °C, very strong
+38-46 °C, extreme above 46 °C); the profile tooltip shows both values at
+each point. The real exposure lies in between the two, since the weather
+data can't tell where trees, buildings or terrain shade the path. Wind is
+Open-Meteo's 10 m wind, as the UTCI expects, at least 0.5 m/s.
+
+The UTCI uses the published 6th-order polynomial approximation (Bröde et
+al. 2012), and SolarCal follows ASHRAE 55; both are ported from
+[pythermalcomfort](https://github.com/CenterForTheBuiltEnvironment/pythermalcomfort)
+(MIT licence) and match it to within 0.00001 °C. This is a readout only:
+it doesn't change the duration or water estimates, since a check against
+11 recorded walks found no link between heat and walking pace (see the
+thermal pace penalty above).
+
 ## Scheduled rest breaks
 
 By default (`--break 60:5`), the simulation inserts a 5-minute rest every

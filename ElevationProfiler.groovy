@@ -176,6 +176,353 @@ List<Map> parseGpx(File file) {
     points
 }
 
+// Felt temperature as the UTCI (Universal Thermal Climate Index): a "feels like" temperature
+// in degC combining air temperature, humidity, wind and radiation. Uses the published 6th-order
+// polynomial approximation (Broede et al. 2012), with its 211 coefficients as implemented in
+// pythermalcomfort (MIT licence, copyright (c) 2019 Federico Tartarini), stored here as
+// [coefficient, power of air temperature, power of wind, power of (mean radiant - air)
+// temperature, power of vapour pressure in kPa].
+//
+// The sun's radiant gain on a walker comes from the ASHRAE 55 SolarCal model, as in
+// pythermalcomfort's solar_gain: standing, under open sky, fully exposed, averaged over the
+// sun's direction relative to the body (0-180 degrees), with skin and clothing absorbing 70%
+// of sunlight and the ground reflecting 25% (dry soil, rock and vegetation reflect 0.2-0.3).
+class ThermalComfort {
+    static final double[][] UTCI_TERMS = [
+        [1.0, 1, 0, 0, 0],
+        [0.607562052, 0, 0, 0, 0],
+        [-0.0227712343, 1, 0, 0, 0],
+        [0.0008064702490000001, 2, 0, 0, 0],
+        [-0.00015427137200000002, 3, 0, 0, 0],
+        [-3.24651735e-06, 4, 0, 0, 0],
+        [7.32602852e-08, 5, 0, 0, 0],
+        [1.3595907300000002e-09, 6, 0, 0, 0],
+        [-2.2583652, 0, 1, 0, 0],
+        [0.0880326035, 1, 1, 0, 0],
+        [0.00216844454, 2, 1, 0, 0],
+        [-1.53347087e-05, 3, 1, 0, 0],
+        [-5.729837039999999e-07, 4, 1, 0, 0],
+        [-2.55090145e-09, 5, 1, 0, 0],
+        [-0.751269505, 0, 2, 0, 0],
+        [-0.00408350271, 1, 2, 0, 0],
+        [-5.2167067500000005e-05, 2, 2, 0, 0],
+        [1.9454466699999997e-06, 3, 2, 0, 0],
+        [1.1409953100000001e-08, 4, 2, 0, 0],
+        [0.158137256, 0, 3, 0, 0],
+        [-6.572631430000001e-05, 1, 3, 0, 0],
+        [2.2269752399999997e-07, 2, 3, 0, 0],
+        [-4.1611703100000005e-08, 3, 3, 0, 0],
+        [-0.0127762753, 0, 4, 0, 0],
+        [9.66891875e-06, 1, 4, 0, 0],
+        [2.5278585200000004e-09, 2, 4, 0, 0],
+        [0.00045630667200000004, 0, 5, 0, 0],
+        [-1.7420254599999998e-07, 1, 5, 0, 0],
+        [-5.91491269e-06, 0, 6, 0, 0],
+        [0.398374029, 0, 0, 1, 0],
+        [0.00018394531400000002, 1, 0, 1, 0],
+        [-0.00017375451, 2, 0, 1, 0],
+        [-7.607811589999999e-07, 3, 0, 1, 0],
+        [3.77830287e-08, 4, 0, 1, 0],
+        [5.430796730000001e-10, 5, 0, 1, 0],
+        [-0.0200518269, 0, 1, 1, 0],
+        [0.000892859837, 1, 1, 1, 0],
+        [3.4543304799999997e-06, 2, 1, 1, 0],
+        [-3.7792577399999997e-07, 3, 1, 1, 0],
+        [-1.69699377e-09, 4, 1, 1, 0],
+        [0.00016999241500000002, 0, 2, 1, 0],
+        [-4.99204314e-05, 1, 2, 1, 0],
+        [2.4741717799999996e-07, 2, 2, 1, 0],
+        [1.07596466e-08, 3, 2, 1, 0],
+        [8.492429320000001e-05, 0, 3, 1, 0],
+        [1.35191328e-06, 1, 3, 1, 0],
+        [-6.21531254e-09, 2, 3, 1, 0],
+        [-4.99410301e-06, 0, 4, 1, 0],
+        [-1.89489258e-08, 1, 4, 1, 0],
+        [8.153001140000001e-08, 0, 5, 1, 0],
+        [0.00075504309, 0, 0, 2, 0],
+        [-5.650952150000001e-05, 1, 0, 2, 0],
+        [-4.52166564e-07, 2, 0, 2, 0],
+        [2.46688878e-08, 3, 0, 2, 0],
+        [2.42674348e-10, 4, 0, 2, 0],
+        [0.00015454725, 0, 1, 2, 0],
+        [5.2411097e-06, 1, 1, 2, 0],
+        [-8.75874982e-08, 2, 1, 2, 0],
+        [-1.50743064e-09, 3, 1, 2, 0],
+        [-1.56236307e-05, 0, 2, 2, 0],
+        [-1.33895614e-07, 1, 2, 2, 0],
+        [2.4970982400000004e-09, 2, 2, 2, 0],
+        [6.51711721e-07, 0, 3, 2, 0],
+        [1.94960053e-09, 1, 3, 2, 0],
+        [-1.0036111299999999e-08, 0, 4, 2, 0],
+        [-1.2120667300000002e-05, 0, 0, 3, 0],
+        [-2.1820366e-07, 1, 0, 3, 0],
+        [7.512694820000001e-09, 2, 0, 3, 0],
+        [9.79063848e-11, 3, 0, 3, 0],
+        [1.25006734e-06, 0, 1, 3, 0],
+        [-1.8158473600000001e-09, 1, 1, 3, 0],
+        [-3.5219767100000004e-10, 2, 1, 3, 0],
+        [-3.3651463e-08, 0, 2, 3, 0],
+        [1.3590835900000001e-10, 1, 2, 3, 0],
+        [4.1703262e-10, 0, 3, 3, 0],
+        [-1.3036902500000002e-09, 0, 0, 4, 0],
+        [4.1390846100000003e-10, 1, 0, 4, 0],
+        [9.22652254e-12, 2, 0, 4, 0],
+        [-5.08220384e-09, 0, 1, 4, 0],
+        [-2.2473096099999998e-11, 1, 1, 4, 0],
+        [1.17139133e-10, 0, 2, 4, 0],
+        [6.62154879e-10, 0, 0, 5, 0],
+        [4.0386326e-13, 1, 0, 5, 0],
+        [1.95087203e-12, 0, 1, 5, 0],
+        [-4.73602469e-12, 0, 0, 6, 0],
+        [5.12733497, 0, 0, 0, 1],
+        [-0.312788561, 1, 0, 0, 1],
+        [-0.0196701861, 2, 0, 0, 1],
+        [0.0009996908700000001, 3, 0, 0, 1],
+        [9.51738512e-06, 4, 0, 0, 1],
+        [-4.66426341e-07, 5, 0, 0, 1],
+        [0.548050612, 0, 1, 0, 1],
+        [-0.00330552823, 1, 1, 0, 1],
+        [-0.0016411944, 2, 1, 0, 1],
+        [-5.16670694e-06, 3, 1, 0, 1],
+        [9.526924319999999e-07, 4, 1, 0, 1],
+        [-0.0429223622, 0, 2, 0, 1],
+        [0.00500845667, 1, 2, 0, 1],
+        [1.00601257e-06, 2, 2, 0, 1],
+        [-1.81748644e-06, 3, 2, 0, 1],
+        [-0.0012581350200000002, 0, 3, 0, 1],
+        [-0.000179330391, 1, 3, 0, 1],
+        [2.3499444099999997e-06, 2, 3, 0, 1],
+        [0.00012973580800000001, 0, 4, 0, 1],
+        [1.2906487e-06, 1, 4, 0, 1],
+        [-2.28558686e-06, 0, 5, 0, 1],
+        [-0.0369476348, 0, 0, 1, 1],
+        [0.00162325322, 1, 0, 1, 1],
+        [-3.1427968000000004e-05, 2, 0, 1, 1],
+        [2.59835559e-06, 3, 0, 1, 1],
+        [-4.77136523e-08, 4, 0, 1, 1],
+        [0.0086420339, 0, 1, 1, 1],
+        [-0.000687405181, 1, 1, 1, 1],
+        [-9.138638719999999e-06, 2, 1, 1, 1],
+        [5.15916806e-07, 3, 1, 1, 1],
+        [-3.5921747600000004e-05, 0, 2, 1, 1],
+        [3.2869651100000006e-05, 1, 2, 1, 1],
+        [-7.10542454e-07, 2, 2, 1, 1],
+        [-1.243823e-05, 0, 3, 1, 1],
+        [-7.385844e-09, 1, 3, 1, 1],
+        [2.2060929599999998e-07, 0, 4, 1, 1],
+        [-0.0007324691800000001, 0, 0, 2, 1],
+        [-1.8738196400000002e-05, 1, 0, 2, 1],
+        [4.80925239e-06, 2, 0, 2, 1],
+        [-8.7549204e-08, 3, 0, 2, 1],
+        [2.7786293000000003e-05, 0, 1, 2, 1],
+        [-5.06004592e-06, 1, 1, 2, 1],
+        [1.14325367e-07, 2, 1, 2, 1],
+        [2.53016723e-06, 0, 2, 2, 1],
+        [-1.72857035e-08, 1, 2, 2, 1],
+        [-3.9507939799999996e-08, 0, 3, 2, 1],
+        [-3.59413173e-07, 0, 0, 3, 1],
+        [7.043880459999999e-07, 1, 0, 3, 1],
+        [-1.89309167e-08, 2, 0, 3, 1],
+        [-4.797687309999999e-07, 0, 1, 3, 1],
+        [7.96079978e-09, 1, 1, 3, 1],
+        [1.6289705800000001e-09, 0, 2, 3, 1],
+        [3.94367674e-08, 0, 0, 4, 1],
+        [-1.18566247e-09, 1, 0, 4, 1],
+        [3.3467804100000003e-10, 0, 1, 4, 1],
+        [-1.15606447e-10, 0, 0, 5, 1],
+        [-2.80626406, 0, 0, 0, 2],
+        [0.548712484, 1, 0, 0, 2],
+        [-0.0039942841, 2, 0, 0, 2],
+        [-0.000954009191, 3, 0, 0, 2],
+        [1.93090978e-05, 4, 0, 0, 2],
+        [-0.308806365, 0, 1, 0, 2],
+        [0.0116952364, 1, 1, 0, 2],
+        [0.000495271903, 2, 1, 0, 2],
+        [-1.90710882e-05, 3, 1, 0, 2],
+        [0.00210787756, 0, 2, 0, 2],
+        [-0.0006984457380000001, 1, 2, 0, 2],
+        [2.30109073e-05, 2, 2, 0, 2],
+        [0.00041785659, 0, 3, 0, 2],
+        [-1.2704387100000003e-05, 1, 3, 0, 2],
+        [-3.04620472e-06, 0, 4, 0, 2],
+        [0.0514507424, 0, 0, 1, 2],
+        [-0.00432510997, 1, 0, 1, 2],
+        [8.99281156e-05, 2, 0, 1, 2],
+        [-7.146639429999999e-07, 3, 0, 1, 2],
+        [-0.000266016305, 0, 1, 1, 2],
+        [0.000263789586, 1, 1, 1, 2],
+        [-7.0119900299999996e-06, 2, 1, 1, 2],
+        [-0.00010682330600000001, 0, 2, 1, 2],
+        [3.61341136e-06, 1, 2, 1, 2],
+        [2.29748967e-07, 0, 3, 1, 2],
+        [0.000304788893, 0, 0, 2, 2],
+        [-6.42070836e-05, 1, 0, 2, 2],
+        [1.16257971e-06, 2, 0, 2, 2],
+        [7.680233839999999e-06, 0, 1, 2, 2],
+        [-5.47446896e-07, 1, 1, 2, 2],
+        [-3.5993791e-08, 0, 2, 2, 2],
+        [-4.36497725e-06, 0, 0, 3, 2],
+        [1.6873796899999998e-07, 1, 0, 3, 2],
+        [2.67489271e-08, 0, 1, 3, 2],
+        [3.2392689700000003e-09, 0, 0, 4, 2],
+        [-0.0353874123, 0, 0, 0, 3],
+        [-0.22120119, 1, 0, 0, 3],
+        [0.0155126038, 2, 0, 0, 3],
+        [-0.000263917279, 3, 0, 0, 3],
+        [0.0453433455, 0, 1, 0, 3],
+        [-0.00432943862, 1, 1, 0, 3],
+        [0.000145389826, 2, 1, 0, 3],
+        [0.00021750861000000002, 0, 2, 0, 3],
+        [-6.66724702e-05, 1, 2, 0, 3],
+        [3.3321714e-05, 0, 3, 0, 3],
+        [-0.00226921615, 0, 0, 1, 3],
+        [0.000380261982, 1, 0, 1, 3],
+        [-5.45314314e-09, 2, 0, 1, 3],
+        [-0.0007963554480000001, 0, 1, 1, 3],
+        [2.5345803400000005e-05, 1, 1, 1, 3],
+        [-6.3122365800000004e-06, 0, 2, 1, 3],
+        [0.000302122035, 0, 0, 2, 3],
+        [-4.77403547e-06, 1, 0, 2, 3],
+        [1.73825715e-06, 0, 1, 2, 3],
+        [-4.09087898e-07, 0, 0, 3, 3],
+        [0.614155345, 0, 0, 0, 4],
+        [-0.0616755931, 1, 0, 0, 4],
+        [0.00133374846, 2, 0, 0, 4],
+        [0.00355375387, 0, 1, 0, 4],
+        [-0.0005130278510000001, 1, 1, 0, 4],
+        [0.00010244975700000002, 0, 2, 0, 4],
+        [-0.00148526421, 0, 0, 1, 4],
+        [-4.11469183e-05, 1, 0, 1, 4],
+        [-6.80434415e-06, 0, 1, 1, 4],
+        [-9.77675906e-06, 0, 0, 2, 4],
+        [0.0882773108, 0, 0, 0, 5],
+        [-0.00301859306, 1, 0, 0, 5],
+        [0.00104452989, 0, 1, 0, 5],
+        [0.000247090539, 0, 0, 1, 5],
+        [0.00148348065, 0, 0, 0, 6]
+    ] as double[][]
+
+    // Projected-area factors for a standing person, rows SHARP 0-180 degrees in 15 degree
+    // steps, columns solar altitude 0-90 degrees in 15 degree steps (ASHRAE 55 Table C2-1).
+    static final double[][] PROJECTED_AREA_STANDING = [
+        [0.35, 0.35, 0.314, 0.258, 0.206, 0.144, 0.082],
+        [0.342, 0.342, 0.31, 0.252, 0.2, 0.14, 0.082],
+        [0.33, 0.33, 0.3, 0.244, 0.19, 0.132, 0.082],
+        [0.31, 0.31, 0.275, 0.228, 0.175, 0.124, 0.082],
+        [0.283, 0.283, 0.251, 0.208, 0.16, 0.114, 0.082],
+        [0.252, 0.252, 0.228, 0.188, 0.15, 0.108, 0.082],
+        [0.23, 0.23, 0.214, 0.18, 0.148, 0.108, 0.082],
+        [0.242, 0.242, 0.222, 0.18, 0.153, 0.112, 0.082],
+        [0.274, 0.274, 0.245, 0.203, 0.165, 0.116, 0.082],
+        [0.304, 0.304, 0.27, 0.22, 0.174, 0.121, 0.082],
+        [0.328, 0.328, 0.29, 0.234, 0.183, 0.125, 0.082],
+        [0.344, 0.344, 0.304, 0.244, 0.19, 0.128, 0.082],
+        [0.347, 0.347, 0.308, 0.246, 0.191, 0.128, 0.082]
+    ] as double[][]
+
+    static final List<Double> SHARP_DEG = [0.0, 45.0, 90.0, 135.0, 180.0]
+    static final double SKIN_ABSORPTIVITY = 0.7
+    static final double GROUND_REFLECTANCE = 0.25
+    // The UTCI polynomial is only valid for wind from 0.5 to 17 m/s at 10 m height.
+    static final double MIN_WIND_M_S = 0.5
+    // WMO definition of sunshine: direct normal irradiance of at least this, in W/m2.
+    static final double SUNNY_DNI_W_M2 = 120.0
+
+    // UTCI in degC, or NaN outside the approximation's valid input range.
+    static double utci(double airTemp, double meanRadiantTemp, double wind10m, double relativeHumidity) {
+        double v = Math.max(wind10m, MIN_WIND_M_S)
+        double deltaTr = meanRadiantTemp - airTemp
+        if (airTemp < -50.0 || airTemp > 50.0 || deltaTr < -30.0 || deltaTr > 70.0 || v > 17.0) {
+            return Double.NaN
+        }
+        double pa = saturationVapourPressureHpa(airTemp) * (relativeHumidity / 100.0) / 10.0
+        double sum = 0.0
+        for (double[] term : UTCI_TERMS) {
+            sum += term[0] * Math.pow(airTemp, term[1]) * Math.pow(v, term[2]) * Math.pow(deltaTr, term[3]) * Math.pow(pa, term[4])
+        }
+        sum
+    }
+
+    // Saturation vapour pressure over water in hPa (Hardy 1998), as the UTCI reference uses.
+    static double saturationVapourPressureHpa(double airTemp) {
+        double[] g = [-2836.5744, -6028.076559, 19.54263612, -0.02737830188, 0.000016261698, 7.0229056e-10, -1.8680009e-13] as double[]
+        double tk = airTemp + 273.15
+        double es = 2.7150305 * Math.log(tk)
+        for (int i = 0; i < g.length; i++) {
+            es += g[i] * Math.pow(tk, i - 2)
+        }
+        Math.exp(es) * 0.01
+    }
+
+    // Increase in mean radiant temperature, in degC, from direct normal irradiance on a
+    // standing walker in full sun, averaged over SHARP_DEG.
+    static double solarDeltaMrt(double solarAltitudeDeg, double dni) {
+        if (solarAltitudeDeg <= 0.0 || dni <= 0.0) {
+            return 0.0
+        }
+        double altitude = Math.min(solarAltitudeDeg, 90.0)
+        double fEff = 0.725
+        double radiativeCoefficient = 6.0
+        double iDiff = 0.2 * dni
+        double total = 0.0
+        for (double sharp : SHARP_DEG) {
+            double fp = projectedAreaFactor(altitude, sharp)
+            double eDiff = fEff * 0.5 * iDiff
+            double eDirect = fEff * fp * dni
+            double eReflected = fEff * 0.5 * (dni * Math.sin(Math.toRadians(altitude)) + iDiff) * GROUND_REFLECTANCE
+            double erf = (eDiff + eDirect + eReflected) * (SKIN_ABSORPTIVITY / 0.95)
+            total += erf / (radiativeCoefficient * fEff)
+        }
+        total / SHARP_DEG.size()
+    }
+
+    // Bilinear interpolation in PROJECTED_AREA_STANDING.
+    static double projectedAreaFactor(double altitudeDeg, double sharpDeg) {
+        int altIndex = Math.min((int) Math.floor(altitudeDeg / 15.0), 5)
+        int sharpIndex = Math.min((int) Math.floor(sharpDeg / 15.0), 11)
+        double fa = (altitudeDeg - altIndex * 15.0) / 15.0
+        double fs = (sharpDeg - sharpIndex * 15.0) / 15.0
+        double[][] t = PROJECTED_AREA_STANDING
+        double low = t[sharpIndex][altIndex] * (1 - fs) + t[sharpIndex + 1][altIndex] * fs
+        double high = t[sharpIndex][altIndex + 1] * (1 - fs) + t[sharpIndex + 1][altIndex + 1] * fs
+        low * (1 - fa) + high * fa
+    }
+
+    // The sun's height above the horizon in degrees at a UTC time (NOAA approximation,
+    // within about 1 degree).
+    static double solarAltitudeDeg(double lat, double lon, LocalDateTime utc) {
+        double hours = utc.hour + utc.minute / 60.0 + utc.second / 3600.0
+        double g = 2 * Math.PI / 365 * (utc.dayOfYear - 1 + (hours - 12) / 24)
+        double decl = 0.006918 - 0.399912 * Math.cos(g) + 0.070257 * Math.sin(g) - 0.006758 * Math.cos(2 * g) +
+            0.000907 * Math.sin(2 * g) - 0.002697 * Math.cos(3 * g) + 0.00148 * Math.sin(3 * g)
+        double eqTime = 229.18 * (0.000075 + 0.001868 * Math.cos(g) - 0.032077 * Math.sin(g) -
+            0.014615 * Math.cos(2 * g) - 0.040849 * Math.sin(2 * g))
+        double solarMinutes = hours * 60 + eqTime + 4 * lon
+        double hourAngle = Math.toRadians(solarMinutes / 4 - 180)
+        double la = Math.toRadians(lat)
+        double sinAlt = Math.sin(la) * Math.sin(decl) + Math.cos(la) * Math.cos(decl) * Math.cos(hourAngle)
+        Math.toDegrees(Math.asin(Math.max(-1.0, Math.min(1.0, sinAlt))))
+    }
+
+    // UTCI heat-stress categories (the cold-stress ones don't arise on a summer walk and are
+    // all reported as no heat stress).
+    static String heatStressCategory(double utci) {
+        if (utci > 46.0) {
+            return 'extreme heat stress'
+        }
+        if (utci > 38.0) {
+            return 'very strong heat stress'
+        }
+        if (utci > 32.0) {
+            return 'strong heat stress'
+        }
+        if (utci > 26.0) {
+            return 'moderate heat stress'
+        }
+        'no heat stress'
+    }
+}
+
 // Inserts points along each straight segment so that no two are more than stepM apart,
 // interpolating position and the GPX's own elevation. A planned route's points can be 20-30 m
 // apart, so without this, short climbs between them disappear from a terrain-model profile.
@@ -643,7 +990,8 @@ Map parseWeatherTimeline(Object weatherData, List<Map> samples) {
             wind: (hourly.wind_speed_10m as List).collect { (it ?: 0.0) as double }
         ]
     }
-    [samples: parsed]
+    // Times are local (timezone=auto); the offset is needed to place the sun for felt heat.
+    [samples: parsed, utcOffsetSeconds: ((locations[0] as Map).utc_offset_seconds ?: 0) as long]
 }
 
 // The Archive API's response only covers the single requested day, unlike the Forecast
@@ -1298,6 +1646,17 @@ void printSummary(double distanceKm, double ascent, double descent, double durat
         ? String.format(Locale.ROOT, ' (breaks pushed this %.1f degC hotter than a straight-through hike: %.1f degC)', tempShift, dynamicResult.peakTempNoBreaks as double)
         : ''
     println String.format(Locale.ROOT, 'Peak temperature               : %.1f degC%s', dynamicResult.peakTemp as double, shiftNote)
+    Map feltHeat = dynamicResult.feltHeat as Map
+    if (feltHeat) {
+        println String.format(Locale.ROOT, 'Sunshine                       : %.0f%% of moving time (direct sun >= %.0f W/m2)',
+            feltHeat.sunnySharePct as double, ThermalComfort.SUNNY_DNI_W_M2)
+        if ((feltHeat.sunnySharePct as double) > 0) {
+            println String.format(Locale.ROOT, 'Felt heat (UTCI) while sunny   : shade %.0f degC, full sun %.0f degC (means)',
+                feltHeat.sunnyMeanShade as double, feltHeat.sunnyMeanSun as double)
+        }
+        println String.format(Locale.ROOT, 'Peak felt heat in full sun     : %.0f degC at %s (%s; shade peak %.0f degC)',
+            feltHeat.peakSun as double, feltHeat.peakSunClock, feltHeat.peakSunCategory, feltHeat.peakShade as double)
+    }
     println String.format(Locale.ROOT, 'Max solar radiation            : %.0f W/m2', dynamicResult.maxRadiation as double)
     println String.format(Locale.ROOT, 'Active moving water            : %.1f L', dynamicResult.movingWaterLitres as double)
     println String.format(Locale.ROOT, 'Break/resting water            : %.1f L', dynamicResult.breakWaterLitres as double)
@@ -1571,6 +1930,11 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             distKm, p1.smoothedEle as double, p1.grade as double, surface, sacScale, eta, strainFactor,
             clockTime, ambientTemp, radiation, segExposure, sunLabel, thermalPenaltyPct
         )
+        double utciShade = (p1.utciShade ?: Double.NaN) as double
+        double utciSun = (p1.utciSun ?: Double.NaN) as double
+        if (!Double.isNaN(utciShade) && !Double.isNaN(utciSun)) {
+            tooltip += String.format(Locale.ROOT, ' | feels %.0f degC shade / %.0f degC full sun', utciShade, utciSun)
+        }
         hitAreas << "<rect x=\"${fmt(Math.min(x0, x1))}\" y=\"${padding}\" width=\"${fmt(Math.max(1.0d, Math.abs(x1 - x0)))}\" height=\"${plotHeight}\" fill=\"transparent\" data-tip=\"${escapeXml(tooltip)}\" data-x=\"${fmt(x1)}\" onmousemove=\"showTip(event)\" onmouseleave=\"hideTip()\" />\n"
     }
 
@@ -1613,6 +1977,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     }
 
     boolean elevationFromTerrain = elevationSummary.source != 'GPX file'
+    Map feltHeat = dynamicResult.feltHeat as Map
     List<double[]> elevationBands = elevationSummary.bands as List<double[]>
     String elevationBandRows = (elevationSummary.bandLabels as List<String>).withIndex().collect { String label, int i ->
         String.format(Locale.ROOT, '<tr><td>%s</td><td>%.0f m</td><td>%.0f m</td></tr>', label, elevationBands[i][0], elevationBands[i][1])
@@ -1807,6 +2172,11 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
         <div><span>Effort (Shenandoah)</span><strong class="clickable" onclick="showEffortInfo()">${effortTier} &#9432;</strong></div>
         <div><span>Water (at <span id="water-tile-temp">${Math.round(waterTempCelsius) as int}</span>&deg;C)</span><strong class="clickable" onclick="showWaterInfo()"><span id="water-tile-value">${String.format(Locale.ROOT, '%.1f L', waterRecommendedCarry)}</span> &#9432;</strong></div>
         <div><span>Steep descent</span><strong class="clickable" onclick="showDescentInfo()">${String.format(Locale.ROOT, '%.2f km', steepDescentKm)} &#9432;</strong></div>
+        ${feltHeat ? """<div>
+            <span>Felt heat in full sun</span>
+            <strong class="clickable" onclick="showHeatInfo()">${String.format(Locale.ROOT, '%.0f&deg;C peak', feltHeat.peakSun as double)} &#9432;</strong>
+            <div class="tile-badge">${feltHeat.peakSunCategory} | ${String.format(Locale.ROOT, '%.0f%% sunny', feltHeat.sunnySharePct as double)}</div>
+        </div>""" : ''}
     </div>
     <div class="mode-toggle">
         <span>Colour by:</span>
@@ -1904,6 +2274,34 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             <button onclick="hideWaterInfo()">Close</button>
         </div>
     </div>
+    ${feltHeat ? """<div id="heat-modal" class="modal-overlay" onclick="hideHeatInfo()">
+        <div class="modal-box" onclick="event.stopPropagation()">
+            <h2>Felt heat in shade and in full sun</h2>
+            <p>
+                Air temperature is always measured in shade; in the sun the body also absorbs
+                radiant heat. This uses the UTCI (Universal Thermal Climate Index), a "feels like"
+                temperature combining air temperature, humidity, wind and radiation, twice for
+                every moment of the simulated walk: in shade, and in full sun on a standing walker
+                under open sky (ASHRAE 55 SolarCal). The real exposure lies in between, since the
+                weather data can't tell where trees, buildings or terrain shade the path.
+            </p>
+            <table>
+                <tr><th>Metric</th><th>This route</th></tr>
+                <tr><td>Sunshine (direct sun &ge; ${String.format(Locale.ROOT, '%.0f', ThermalComfort.SUNNY_DNI_W_M2)} W/m&sup2;)</td><td>${String.format(Locale.ROOT, '%.0f%% of moving time', feltHeat.sunnySharePct as double)}</td></tr>
+                ${(feltHeat.sunnySharePct as double) > 0 ? String.format(Locale.ROOT, '<tr><td>Mean felt heat while sunny, shade</td><td>%.0f&deg;C</td></tr><tr><td>Mean felt heat while sunny, full sun</td><td>%.0f&deg;C</td></tr>', feltHeat.sunnyMeanShade as double, feltHeat.sunnyMeanSun as double) : ''}
+                <tr><td>Peak in full sun</td><td>${String.format(Locale.ROOT, '%.0f&deg;C at %s', feltHeat.peakSun as double, feltHeat.peakSunClock)}</td></tr>
+                <tr><td>Peak in shade</td><td>${String.format(Locale.ROOT, '%.0f&deg;C', feltHeat.peakShade as double)}</td></tr>
+                <tr><td>Heat stress at the full-sun peak</td><td>${feltHeat.peakSunCategory}</td></tr>
+            </table>
+            <p style="font-size: 12px; color: #666;">
+                UTCI heat-stress categories: moderate 26-32&deg;C, strong 32-38&deg;C, very strong
+                38-46&deg;C, extreme above 46&deg;C. Wind is Open-Meteo's 10 m wind, as the UTCI
+                expects. Sunshine follows the WMO definition. This is a readout only: it doesn't
+                change the duration or water estimates.
+            </p>
+            <button onclick="hideHeatInfo()">Close</button>
+        </div>
+    </div>""" : ''}
     <div id="elevation-modal" class="modal-overlay" onclick="hideElevationInfo()">
         <div class="modal-box" onclick="event.stopPropagation()">
             <h2>Ascent and descent by gradient</h2>
@@ -2187,6 +2585,20 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
             updateDurationSlider();
         }
 
+        var heatModal = document.getElementById('heat-modal');
+
+        function showHeatInfo() {
+            if (heatModal) {
+                heatModal.classList.add('open');
+            }
+        }
+
+        function hideHeatInfo() {
+            if (heatModal) {
+                heatModal.classList.remove('open');
+            }
+        }
+
         var elevationModal = document.getElementById('elevation-modal');
 
         function showElevationInfo() {
@@ -2286,6 +2698,7 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
                 hideWaterInfo();
                 hideDescentInfo();
                 hideElevationInfo();
+                hideHeatInfo();
                 hideTrailStrainInfo();
                 hideDurationInfo();
             }
@@ -2550,6 +2963,15 @@ double startTempEncountered = options.tempCelsius
 double peakTempEncountered = options.tempCelsius
 double peakTempWithoutBreaksEncountered = options.tempCelsius
 double maxRadiationEncountered = 0.0
+// Felt heat (UTCI) while walking, weighted by moving time: an informational readout, not
+// (yet) a pace input - see "Felt heat in shade and in full sun" in README.md.
+double heatMovingHours = 0.0
+double sunnyMovingHours = 0.0
+double sunnyUtciShadeHours = 0.0
+double sunnyUtciSunHours = 0.0
+double peakUtciShade = Double.NaN
+double peakUtciSun = Double.NaN
+String peakUtciSunClock = null
 Map<String, Double> surfaceDistanceM = [:].withDefault { 0.0 }
 points[0].grade = 0.0
 points[0].strainFactor = 1.0
@@ -2693,6 +3115,33 @@ for (int i = 1; i < points.size(); i++) {
     double vSegThermal = vSegEffort * thermalFactor
     double tSegHours = segDistKm / vSegThermal
 
+    double segUtciShade = Double.NaN
+    double segUtciSun = Double.NaN
+    boolean segSunny = false
+    if (segWeather) {
+        LocalDateTime segUtc = segClock.minusSeconds(weatherTimeline.utcOffsetSeconds as long)
+        double sunAltitude = ThermalComfort.solarAltitudeDeg(points[i].lat as double, points[i].lon as double, segUtc)
+        double segDni = segWeather.dni as double
+        double segWind = segWeather.wind as double
+        double segHumidity = segWeather.humidity as double
+        segSunny = sunAltitude > 0.0 && segDni >= ThermalComfort.SUNNY_DNI_W_M2
+        segUtciShade = ThermalComfort.utci(segTemp, segTemp, segWind, segHumidity)
+        segUtciSun = ThermalComfort.utci(segTemp, segTemp + ThermalComfort.solarDeltaMrt(sunAltitude, segDni), segWind, segHumidity)
+        if (!Double.isNaN(segUtciShade) && !Double.isNaN(segUtciSun)) {
+            heatMovingHours += tSegHours
+            if (segSunny) {
+                sunnyMovingHours += tSegHours
+                sunnyUtciShadeHours += segUtciShade * tSegHours
+                sunnyUtciSunHours += segUtciSun * tSegHours
+            }
+            peakUtciShade = Double.isNaN(peakUtciShade) ? segUtciShade : Math.max(peakUtciShade, segUtciShade)
+            if (Double.isNaN(peakUtciSun) || segUtciSun > peakUtciSun) {
+                peakUtciSun = segUtciSun
+                peakUtciSunClock = segClock.format(DateTimeFormatter.ofPattern('HH:mm'))
+            }
+        }
+    }
+
     totalTerrainDurationHours += segDistKm / vSegEffort
     totalEffortDurationHours += tSegHours
     wallClockElapsedHours += tSegHours
@@ -2707,6 +3156,8 @@ for (int i = 1; i < points.size(); i++) {
     points[i].exposureFactor = segExposure
     points[i].thermalPenaltyPct = (1.0 - thermalFactor) * 100.0
     points[i].sunLabel = sunLabelFor(canopyClass, segRadiation)
+    points[i].utciShade = segUtciShade
+    points[i].utciSun = segUtciSun
 
     // Scheduled resting breaks: triggered by pure moving time (not wall clock), so the
     // cadence is "every N minutes of walking" and doesn't drift from counting break time
@@ -2761,6 +3212,15 @@ Map dynamicResult = dynamicWeatherSummary(
     startTempEncountered, peakTempEncountered, peakTempWithoutBreaksEncountered, maxRadiationEncountered,
     totalDynamicWaterLitres, totalBreakWaterLitres, waterResult.recommendedCarry as double, weatherMatched
 )
+dynamicResult.feltHeat = heatMovingHours > 0 ? [
+    sunnySharePct: sunnyMovingHours / heatMovingHours * 100.0,
+    sunnyMeanShade: sunnyMovingHours > 0 ? sunnyUtciShadeHours / sunnyMovingHours : Double.NaN,
+    sunnyMeanSun: sunnyMovingHours > 0 ? sunnyUtciSunHours / sunnyMovingHours : Double.NaN,
+    peakShade: peakUtciShade,
+    peakSun: peakUtciSun,
+    peakSunClock: peakUtciSunClock,
+    peakSunCategory: ThermalComfort.heatStressCategory(peakUtciSun)
+] : null
 
 printSummary(totalDistanceKm, totalAscent, totalDescent, durationHours, difficultyResult, shenandoahResult, waterResult, trailInfo, descentStrain, trailStrain, durationResult, dynamicResult, surfaceAttribution, elevationSummary)
 
