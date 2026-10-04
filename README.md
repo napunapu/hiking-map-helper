@@ -227,6 +227,76 @@ elevations predicted moving time slightly better than before (within about
 terrain-model elevations so it measures the same profile the profiler now
 uses.
 
+## Analysing recorded walks
+
+`WalkAnalyser.groovy`, a third standalone script, analyses walks recorded
+on an Apple Watch and exported from HealthFit as FIT plus GPX with the
+same name:
+
+```sh
+groovy WalkAnalyser.groovy [-t <m>] [--no-terrain-start] [--no-weather] [--fit-altitude] [--maps <dir>] <walk.fit> [...]
+```
+
+The FIT file supplies the watch's distance, heart rate, cadence and
+session totals; altitudes come from the GPX export, matched by timestamp,
+since the FIT format rounds altitude to 0.2 m steps, which inflates ascent
+by about 3% at small thresholds (`--fit-altitude` uses them anyway). Names
+are matched with whitespace normalised, since Apple Watch names contain a
+non-breaking space that a re-export can turn into a normal one. Terrain
+tiles and weather are cached in the nearest existing `maps/` folder next
+to the input file or one level up (`--maps` to choose), so walks under
+`gpx/real_world/` share the profiler's `gpx/maps/mdt05/` tiles. For each
+walk it reports:
+
+- **Time and distance**: elapsed, moving (faster than 0.5 m/s over 20 s)
+  and stopped time, and the watch's distance.
+- **Ascent and descent**: a hysteresis filter at 0.4 m (`-t`), suited to
+  the watch's already smoothed barometric altitude at full precision
+  (GPS-only altitude from other devices needs about 3 m), with the watch's
+  own session total alongside, the altitude range and the gradient bands
+  described above.
+- **Start correction**: the barometer can read wrong for the first seconds
+  or minutes of a walk (up to about ±13 m on the GR92 walks). The watch's
+  steady offset from the IGN MDT05 terrain model is measured beyond the
+  first 2 km; until the watch first comes within 2 m of terrain plus that
+  offset, its altitude is replaced by that reference, blending back over
+  the last 50 m. Nothing is corrected if the start is already within 2 m,
+  or the watch doesn't settle within 2 km (a slow drift rather than a start
+  error). `--no-terrain-start` turns this off.
+- **Heart rate**: the watch's average, maximum and minimum, the average
+  while moving as a share of heart-rate reserve (from the watch's own
+  resting and maximum heart rate), net heartbeats above resting while
+  moving, and time in the watch's heart-rate zones.
+- **Heart rate by gradient**: for climbs and descents in each gradient
+  band, distance, time, mean heart rate and net heartbeats per km relative
+  to near-flat (0-5%) walking, beside Minetti's (2002) metabolic cost of
+  walking for the same gradient. Each stretch is paired with the heart rate
+  30 s later, since heart rate trails a change in effort. Net heartbeats
+  track energy expenditure far better than time does, so this is a
+  personal check on what a gradient really costs.
+- **Steps, energy and effort**: steps (the FIT stores walking cadence as
+  stride pairs per minute), average step length, calories, average METs,
+  the watch's training load and its effort rating (marked when the watch
+  estimated it rather than you entering it).
+- **Weather**: the watch's single temperature and humidity per walk, which
+  is the weather at the start rather than an average, and Open-Meteo
+  Archive weather sampled every 15 minutes at the time and altitude each
+  point was actually passed, with felt heat (UTCI) in shade and in full sun
+  as described above. Responses are cached once a walk is a week old, since
+  more recent archive data can still be revised.
+
+With several files, a final table compares the walks side by side. Its
+ascent, descent and steep figures reproduce the separate Python analyser
+these rules come from exactly on the 11 recorded GR92 walks.
+
+Across those walks (excluding one deliberate all-out effort), net
+heartbeats rose by about 3% per °C of mean air temperature for the same
+route effort, while walking pace showed no link to heat at all: on this
+evidence, heat shows up in heart rate, not pace. The per-gradient heart
+rate followed Minetti's curve on climbs (somewhat less steeply above 15%),
+but steep descents cost more per km than flat walking (1.1-1.5x), not the
+0.4-0.6x Minetti measured on a treadmill, since they are walked slowly.
+
 ## Difficulty ratings
 
 The tool reports two independent ratings, since no single number captures

@@ -45,16 +45,25 @@ calibrator against a recorded track that covers genuinely rough or loose
 terrain would let severe-loose surfaces be calibrated distinctly instead of
 inheriting a value derived mostly from firmer trail.
 
-## Recorded-walk analysis in Groovy
+## Recorded walks in RouteCalibrator
 
-The recorded-walk side of the separate Python project (`GR92 actual`:
-Apple Watch FIT/GPX loading, the barometer start correction against the
-terrain model, gradient bands on recorded altitude) could move into
-`RouteCalibrator.groovy`, so calibration uses full-precision GPX altitude
-(FIT rounds to 0.2 m steps) and corrects the barometer's start error. The
-Garmin FIT SDK is on Maven Central (`com.garmin:fit`), so `@Grab` works;
-the heart rate in the FIT files would be the right way to test the flat
-equivalent distance model, which moving time can't validate.
+`WalkAnalyser.groovy` now reads FIT files (Garmin FIT SDK) with
+full-precision GPX altitude, the barometer start correction and heart
+rate. `RouteCalibrator.groovy` still takes a recorded GPX and computes
+distance from GPS positions; giving it the same FIT loading would let
+calibration use the watch's distance and the corrected altitude.
+
+## Use heart rate to recalibrate the flat equivalent model
+
+On 10 recorded walks, net heartbeats per km by gradient followed Minetti
+(2002) on climbs, but steep descents cost 1.1-1.5x flat rather than
+Minetti's 0.4-0.6x, while `minettiCostMultiplier`'s current polynomial
+(not Minetti's) gives 2-6x there and too little on climbs. Total flat
+equivalent as coded predicted per-walk heartbeats worst of the models
+tried; Minetti's curve without the braking surcharge did best, within
+about 10% once heartbeats are adjusted for heat (about +3% per degC).
+A heart-rate-calibrated cost curve could replace both the polynomial and
+the surcharge.
 
 ## Decide on the thermal pace penalty
 

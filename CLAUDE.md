@@ -6,9 +6,14 @@ Guidance for Claude Code when working in this repository.
 
 This repository holds `ElevationProfiler.groovy`, a standalone CLI tool
 that turns a GPX hiking route into a colour-coded HTML elevation profile
-(see `README.md` for usage). GPX route files and generated map cache are
-kept locally under `gpx/`, which is gitignored — not tracked in this
-repository.
+(see `README.md` for usage), plus two standalone companions:
+`RouteCalibrator.groovy` (calibrates the duration model against a recorded
+track) and `WalkAnalyser.groovy` (analyses recorded Apple Watch walks from
+FIT and GPX exports). Shared classes (`TerrainModel`, `ThermalComfort`) are
+mirrored between the scripts rather than shared, so each runs on its own;
+keep the copies identical. GPX route files, recorded walks
+(`gpx/real_world/`) and generated map cache are kept locally under `gpx/`,
+which is gitignored — not tracked in this repository.
 
 ## Code style
 
