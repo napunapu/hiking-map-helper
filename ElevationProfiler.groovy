@@ -53,6 +53,101 @@ class Options {
 
     @Option(names = ['--break'], description = 'Rest break cadence as interval:duration in minutes, e.g. "60:6" for a 6-min pause every 60 min of movement; "0:0" disables breaks (default: 60:5)')
     String breakSpec = '60:5'
+
+    @Option(names = ['--elevation'], description = 'Elevation source: "terrain" (IGN MDT05 5 m terrain model, Spain only; falls back to the GPX if unavailable) or "gpx" (the file\'s own elevations) (default: terrain)')
+    String elevationSource = 'terrain'
+}
+
+// IGN MDT05 digital terrain model (5 m cells, Spain only), fetched from the public WCS
+// service in 0.02 degree tiles (about 2 km, ~1.4 MB each) and cached as files, since the
+// terrain doesn't change. Tiles are requested as ESRI ASCII grid rather than GeoTIFF,
+// because the GeoTIFF output is whole metres only. The model is bare ground: buildings,
+// bridges and embankments are removed.
+class TerrainModel {
+    static final String WCS_URL_TEMPLATE = 'https://servicios.idee.es/wcs-inspire/mdt?SERVICE=WCS&REQUEST=GetCoverage' +
+        '&VERSION=2.0.1&COVERAGEID=Elevacion4258_5&SUBSET=lat(%.4f,%.4f)&SUBSET=long(%.4f,%.4f)&FORMAT=application/asc'
+    static final double TILE_DEG = 0.02
+
+    File cacheDir
+    int downloadedCount = 0
+    private Map<String, Map> tiles = [:]
+
+    TerrainModel(File cacheDir) {
+        this.cacheDir = cacheDir
+    }
+
+    // Terrain height at a position by bilinear interpolation between cell centres, or NaN
+    // where the model has no data (outside Spain, or open sea).
+    double height(double lat, double lon) {
+        long latIndex = (long) Math.floor(lat / TILE_DEG + 1e-9)
+        long lonIndex = (long) Math.floor(lon / TILE_DEG + 1e-9)
+        Map tile = tileAt(latIndex * TILE_DEG, lonIndex * TILE_DEG)
+        double cell = tile.cellsize as double
+        int nrows = tile.nrows as int
+        int ncols = tile.ncols as int
+        double[] grid = tile.grid as double[]
+        // Row 0 is the northern edge.
+        double top = (tile.yllcorner as double) + nrows * cell
+        double x = (lon - (tile.xllcorner as double)) / cell - 0.5
+        double y = (top - lat) / cell - 0.5
+        int x0 = Math.min(Math.max((int) Math.floor(x), 0), ncols - 2)
+        int y0 = Math.min(Math.max((int) Math.floor(y), 0), nrows - 2)
+        double fx = x - x0
+        double fy = y - y0
+        double north = grid[y0 * ncols + x0] * (1 - fx) + grid[y0 * ncols + x0 + 1] * fx
+        double south = grid[(y0 + 1) * ncols + x0] * (1 - fx) + grid[(y0 + 1) * ncols + x0 + 1] * fx
+        north * (1 - fy) + south * fy
+    }
+
+    private Map tileAt(double lat0, double lon0) {
+        String name = String.format(Locale.ROOT, 'mdt05_%.2f_%.2f.asc', lat0, lon0)
+        if (tiles.containsKey(name)) {
+            return tiles[name]
+        }
+        File file = new File(cacheDir, name)
+        if (!file.exists()) {
+            String url = String.format(Locale.ROOT, WCS_URL_TEMPLATE, lat0, lat0 + TILE_DEG, lon0, lon0 + TILE_DEG)
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
+            HttpRequest request = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(180)).GET().build()
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString())
+            if (response.statusCode() != 200 || !response.body().contains('ncols')) {
+                throw new RuntimeException("terrain tile ${name} request failed with HTTP ${response.statusCode()}")
+            }
+            cacheDir.mkdirs()
+            file.text = response.body()
+            downloadedCount++
+        }
+        Map tile = parseAsciiGrid(file.text)
+        tiles[name] = tile
+        tile
+    }
+
+    // Parses an ESRI ASCII grid, skipping the multipart wrapper the WCS adds before it and the
+    // further sections (.prj) after it - only nrows x ncols values are read.
+    private static Map parseAsciiGrid(String text) {
+        List<String> lines = text.substring(text.indexOf('ncols')).readLines()
+        Map header = [:]
+        int lineIndex = 0
+        while (lineIndex < lines.size() && lines[lineIndex] && Character.isLetter(lines[lineIndex].charAt(0))) {
+            String[] parts = lines[lineIndex].trim().split(/\s+/)
+            header[parts[0].toLowerCase()] = parts[1] as double
+            lineIndex++
+        }
+        int nrows = header.nrows as int
+        int ncols = header.ncols as int
+        Double nodata = header.nodata_value as Double
+        double[] grid = new double[nrows * ncols]
+        int n = 0
+        for (int i = lineIndex; i < lines.size() && n < grid.length; i++) {
+            for (String token : lines[i].trim().split(/\s+/)) {
+                if (token && n < grid.length) {
+                    double value = token as double
+                    grid[n++] = (nodata != null && value == nodata) ? Double.NaN : value
+                }
+            }
+        }
+        [nrows: nrows, ncols: ncols, cellsize: header.cellsize, xllcorner: header.xllcorner, yllcorner: header.yllcorner, grid: grid]
+    }
 }
 
 double haversine(double lat1, double lon1, double lat2, double lon2) {
@@ -79,6 +174,56 @@ List<Map> parseGpx(File file) {
         points << [lat: lat, lon: lon, ele: ele]
     }
     points
+}
+
+// Inserts points along each straight segment so that no two are more than stepM apart,
+// interpolating position and the GPX's own elevation. A planned route's points can be 20-30 m
+// apart, so without this, short climbs between them disappear from a terrain-model profile.
+List<Map> densifyRoute(List<Map> points, double stepM) {
+    List<Map> dense = [points[0].clone() as Map]
+    for (int i = 1; i < points.size(); i++) {
+        Map a = points[i - 1]
+        Map b = points[i]
+        double d = haversine(a.lat as double, a.lon as double, b.lat as double, b.lon as double)
+        int steps = Math.max(1, (int) Math.ceil(d / stepM))
+        for (int s = 1; s <= steps; s++) {
+            double f = s / (double) steps
+            dense << [
+                lat: (a.lat as double) + ((b.lat as double) - (a.lat as double)) * f,
+                lon: (a.lon as double) + ((b.lon as double) - (a.lon as double)) * f,
+                ele: (a.ele as double) + ((b.ele as double) - (a.ele as double)) * f
+            ]
+        }
+    }
+    dense
+}
+
+List<Double> rollingMedian(List<Double> values, int half) {
+    int n = values.size()
+    List<Double> result = new ArrayList<>(n)
+    for (int i = 0; i < n; i++) {
+        List<Double> window = values.subList(Math.max(0, i - half), Math.min(n, i + half + 1)).sort(false)
+        result << window[window.size().intdiv(2)]
+    }
+    result
+}
+
+// Replaces each point's elevation with the terrain model's, after densifying the route to
+// the model's 5 m cell size. A 25 m median damps single-cell jumps where the route line
+// runs along a cliff edge or crosses a removed bridge. Returns null (leaving the caller on
+// the GPX elevations) if any point lies outside the model's coverage, since mixing two
+// sources with different height references would put false steps in the profile.
+List<Map> applyTerrainElevation(List<Map> points, TerrainModel terrain) {
+    List<Map> dense = densifyRoute(points, 5.0)
+    List<Double> heights = dense.collect { terrain.height(it.lat as double, it.lon as double) }
+    if (heights.any { Double.isNaN(it) }) {
+        return null
+    }
+    List<Double> damped = rollingMedian(heights, 2)
+    for (int i = 0; i < dense.size(); i++) {
+        dense[i].ele = damped[i]
+    }
+    dense
 }
 
 Map computeBoundingBox(List<Map> points) {
@@ -200,36 +345,74 @@ double pointToSegmentDistanceM(double plat, double plon, double alat, double alo
 // Finds the nearest highway way within thresholdM and returns its raw tags (empty if nothing
 // is close enough) - the surface-resolution hierarchy below reads whichever tags it needs
 // directly, rather than this function pre-deciding a single surface value.
-Map nearestWayInfo(double plat, double plon, List<Map> ways, double thresholdM) {
-    double latPad = thresholdM / 110540.0
-    double lonPad = thresholdM / (111320.0 * Math.cos(Math.toRadians(plat)))
-
-    double bestDist = Double.MAX_VALUE
-    Map bestTags = null
-
+// Grid index over every way segment, so snapping a point only checks segments in nearby
+// cells rather than every segment in the bounding box - needed once a terrain-model route is
+// densified to a point every 5 m. Segments keep their original way order, so the nearest
+// match (first strictly closest) is the same as a full scan would find.
+Map buildWaySegmentIndex(List<Map> ways, double cellDeg) {
+    List<double[]> segments = []
+    List<Map> segmentTags = []
+    Map<Long, List<Integer>> cells = [:]
     for (way in ways) {
         List<Map> geom = way.geom as List<Map>
         for (int i = 1; i < geom.size(); i++) {
-            Map a = geom[i - 1]
-            Map b = geom[i]
-            double aLat = a.lat as double
-            double aLon = a.lon as double
-            double bLat = b.lat as double
-            double bLon = b.lon as double
+            double[] seg = [geom[i - 1].lat as double, geom[i - 1].lon as double, geom[i].lat as double, geom[i].lon as double] as double[]
+            int segIndex = segments.size()
+            segments << seg
+            segmentTags << (way.tags as Map)
+            long r0 = (long) Math.floor(Math.min(seg[0], seg[2]) / cellDeg)
+            long r1 = (long) Math.floor(Math.max(seg[0], seg[2]) / cellDeg)
+            long c0 = (long) Math.floor(Math.min(seg[1], seg[3]) / cellDeg)
+            long c1 = (long) Math.floor(Math.max(seg[1], seg[3]) / cellDeg)
+            for (long r = r0; r <= r1; r++) {
+                for (long c = c0; c <= c1; c++) {
+                    cells.computeIfAbsent(r * 10000000L + c) { [] } << segIndex
+                }
+            }
+        }
+    }
+    [cellDeg: cellDeg, segments: segments, segmentTags: segmentTags, cells: cells]
+}
 
-            // Cheap bounding-box rejection before the more expensive projected distance.
-            if (Math.min(aLat, bLat) - latPad > plat || Math.max(aLat, bLat) + latPad < plat) {
-                continue
-            }
-            if (Math.min(aLon, bLon) - lonPad > plon || Math.max(aLon, bLon) + lonPad < plon) {
-                continue
-            }
+Map nearestWayInfo(double plat, double plon, Map wayIndex, double thresholdM) {
+    double latPad = thresholdM / 110540.0
+    double lonPad = thresholdM / (111320.0 * Math.cos(Math.toRadians(plat)))
+    double cellDeg = wayIndex.cellDeg as double
+    Map<Long, List<Integer>> cells = wayIndex.cells as Map<Long, List<Integer>>
+    List<double[]> segments = wayIndex.segments as List<double[]>
 
-            double d = pointToSegmentDistanceM(plat, plon, aLat, aLon, bLat, bLon)
-            if (d < bestDist) {
-                bestDist = d
-                bestTags = way.tags as Map
+    // Candidate segments from every cell the point's search box touches, in original order.
+    TreeSet<Integer> candidates = new TreeSet<>()
+    for (long r = (long) Math.floor((plat - latPad) / cellDeg); r <= (long) Math.floor((plat + latPad) / cellDeg); r++) {
+        for (long c = (long) Math.floor((plon - lonPad) / cellDeg); c <= (long) Math.floor((plon + lonPad) / cellDeg); c++) {
+            List<Integer> cell = cells.get(r * 10000000L + c)
+            if (cell) {
+                candidates.addAll(cell)
             }
+        }
+    }
+
+    double bestDist = Double.MAX_VALUE
+    Map bestTags = null
+    for (int segIndex : candidates) {
+        double[] seg = segments[segIndex]
+        double aLat = seg[0]
+        double aLon = seg[1]
+        double bLat = seg[2]
+        double bLon = seg[3]
+
+        // Cheap bounding-box rejection before the more expensive projected distance.
+        if (Math.min(aLat, bLat) - latPad > plat || Math.max(aLat, bLat) + latPad < plat) {
+            continue
+        }
+        if (Math.min(aLon, bLon) - lonPad > plon || Math.max(aLon, bLon) + lonPad < plon) {
+            continue
+        }
+
+        double d = pointToSegmentDistanceM(plat, plon, aLat, aLon, bLat, bLon)
+        if (d < bestDist) {
+            bestDist = d
+            bestTags = wayIndex.segmentTags[segIndex] as Map
         }
     }
 
@@ -1225,9 +1408,17 @@ String buildHtml(List<Map> points, double distanceKm, double ascent, double desc
     int solarBandHeight = 8
     int solarBandY = padding - 14
 
-    for (int i = 1; i < points.size(); i++) {
-        Map p0 = points[i - 1]
-        Map p1 = points[i]
+    // Draw at most one segment per horizontal pixel: a terrain-model route has a point every
+    // 5 m, several per pixel, which would only bloat the file without showing more detail.
+    int renderStride = Math.max(1, (int) Math.ceil((points.size() - 1) / (double) plotWidth))
+    List<Integer> renderIndices = (0..<points.size()).step(renderStride)
+    if (renderIndices[-1] != points.size() - 1) {
+        renderIndices << points.size() - 1
+    }
+
+    for (int r = 1; r < renderIndices.size(); r++) {
+        Map p0 = points[renderIndices[r - 1]]
+        Map p1 = points[renderIndices[r]]
         double x0 = xFor(p0.distance as double)
         double x1 = xFor(p1.distance as double)
         double y0 = yFor(p0.smoothedEle as double)
@@ -2020,7 +2211,30 @@ if (points.size() < 2) {
 // since it's large, regeneratable, third-party-derived cache data rather than source data.
 File mapsDir = new File(options.gpxFile.absoluteFile.parentFile, 'maps')
 mapsDir.mkdirs()
-File cacheFile = new File(mapsDir, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '.osm.json')
+
+// Planned-route GPX elevations are usually smoothed map data that cut off summits and lose
+// short climbs, so the terrain model is the default source; see applyTerrainElevation.
+String elevationSourceLabel = 'GPX file'
+if (options.elevationSource == 'terrain') {
+    try {
+        TerrainModel terrain = new TerrainModel(new File(mapsDir, 'mdt05'))
+        List<Map> terrainPoints = applyTerrainElevation(points, terrain)
+        if (terrainPoints) {
+            points = terrainPoints
+            elevationSourceLabel = 'IGN MDT05 terrain model'
+            String downloadNote = terrain.downloadedCount > 0 ? ", ${terrain.downloadedCount} tile(s) downloaded" : ''
+            println "Elevation from IGN MDT05 terrain model (every 5 m along the route${downloadNote})"
+        } else {
+            System.err.println('Route leaves the IGN MDT05 coverage (Spain only); using the GPX file\'s own elevations.')
+        }
+    } catch (Exception ex) {
+        System.err.println("IGN MDT05 terrain model unavailable (${ex.message}); using the GPX file's own elevations.")
+    }
+} else if (options.elevationSource != 'gpx') {
+    System.err.println("Unknown --elevation '${options.elevationSource}', expected terrain or gpx; using the GPX file's own elevations.")
+}
+
+File cacheFile =new File(mapsDir, options.gpxFile.name.replaceFirst(/(?i)\.gpx$/, '') + '.osm.json')
 Map osmData = null
 String matchSource = 'none'
 
@@ -2048,6 +2262,7 @@ if (!options.noCache && cacheFile.exists()) {
 List<Map> osmWays = parseOsmWays(osmData)
 List<Map> landcoverFeatures = parseLandcoverFeatures(osmData)
 Map trailInfo = [matched: !osmWays.isEmpty(), source: matchSource]
+Map wayIndex = buildWaySegmentIndex(osmWays, 0.001)
 double surfaceSnapThresholdM = 30.0
 double landcoverThresholdM = 15.0
 
@@ -2115,7 +2330,7 @@ Map<String, Integer> surfaceTierCounts = [:].withDefault { 0 }
 for (int i = 0; i < points.size(); i++) {
     double plat = points[i].lat as double
     double plon = points[i].lon as double
-    Map wayInfo = nearestWayInfo(plat, plon, osmWays, surfaceSnapThresholdM)
+    Map wayInfo = nearestWayInfo(plat, plon, wayIndex, surfaceSnapThresholdM)
     Map tags = wayInfo.tags as Map
     Map resolved = resolveSurfaceAndEta(plat, plon, tags, landcoverFeatures, landcoverThresholdM)
 
@@ -2191,12 +2406,23 @@ if (weatherMatched) {
         peakTempWithoutBreaksEncountered = startTempEncountered
     }
 }
+// Ascent/descent use a hysteresis filter: a change counts only once the smoothed elevation
+// has moved at least ascentThresholdM from the last counted point, which then becomes the new
+// reference - small wobble is ignored, but slow, steady climbs are still counted in full. The
+// terrain-model profile, sampled every 5 m, needs it; a planned GPX's own smoothed elevations
+// keep the original behaviour of summing every change. 0.5 m matched the Apple Watch's
+// barometric ascent with no overall bias across 11 recorded GR92 stages.
+double ascentThresholdM = elevationSourceLabel == 'GPX file' ? 0.0 : 0.5
+double ascentReferenceEle = points[0].smoothedEle as double
 for (int i = 1; i < points.size(); i++) {
-    double deltaEle = (points[i].smoothedEle as double) - (points[i - 1].smoothedEle as double)
-    if (deltaEle > 0) {
-        totalAscent += deltaEle
-    } else {
-        totalDescent += -deltaEle
+    double eleChange = (points[i].smoothedEle as double) - ascentReferenceEle
+    if (Math.abs(eleChange) >= ascentThresholdM) {
+        if (eleChange > 0) {
+            totalAscent += eleChange
+        } else {
+            totalDescent += -eleChange
+        }
+        ascentReferenceEle = points[i].smoothedEle as double
     }
 
     // Consecutive GPS fixes can sit only centimetres apart, so grade is measured

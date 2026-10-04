@@ -11,13 +11,14 @@ pace and hydration.
 - [Groovy](https://groovy-lang.org/) on your `PATH`.
 - Internet access on first run, so `@Grab` can download
   [picocli](https://picocli.info/) (cached afterwards), and to query the
-  Overpass API (trail surface) and Open-Meteo API (weather/solar) — neither
-  needs an API key; see below.
+  Overpass API (trail surface), Open-Meteo API (weather/solar) and the IGN
+  terrain model service (elevation, Spain) — none needs an API key; see
+  below.
 
 ## Usage
 
 ```sh
-groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>] [-s <speed>] [--start-time <HH:mm>] [--date <yyyy-MM-dd>] [--break <interval:duration>] [--no-cache]
+groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t <tempC>] [-e <exposure>] [-s <speed>] [--start-time <HH:mm>] [--date <yyyy-MM-dd>] [--break <interval:duration>] [--elevation <terrain|gpx>] [--no-cache]
 ```
 
 | Option | Description | Default |
@@ -30,6 +31,7 @@ groovy ElevationProfiler.groovy <input.gpx> [-w <window>] [-o <output.html>] [-t
 | `--start-time` | Planned hike start time, `HH:mm` 24h — anchors the weather/solar simulation | `07:00` |
 | `--date` | Planned hike date, `yyyy-MM-dd` — any past date (queries the Archive API) or up to 16 days ahead (Forecast API); further ahead than that disables the weather/solar simulation for that run, falling back to `-t`/`--temp` | today |
 | `--break` | Rest break cadence as `interval:duration` in minutes, e.g. `60:6` for a 6 min pause every 60 min of *moving* time; `0:0` disables breaks | `60:5` |
+| `--elevation` | Elevation source: `terrain` (IGN MDT05 terrain model, Spain only, falling back to the GPX outside its coverage or offline) or `gpx` (the file's own elevations) — see "Elevation from the terrain model" below | `terrain` |
 | `--no-cache` | Force re-querying the Overpass and Open-Meteo APIs even if cached responses exist | `false` |
 | `-h`, `--help` | Show usage and exit | |
 | `-V`, `--version` | Show version and exit | |
@@ -65,7 +67,47 @@ tool itself, so nothing under it is tracked or pushed.
   sit only centimetres apart. Any residual reading over 100% (physically
   implausible on foot) is capped, and the difficulty explanation below notes
   when that happened.
-- **Ascent / descent**: summed from the smoothed elevation profile.
+- **Ascent / descent**: summed from the smoothed elevation profile. With
+  terrain-model elevations, a hysteresis filter counts a climb or drop only
+  once the profile has moved 0.5 m from the last counted point, so small
+  wobble is ignored but slow, steady climbs still count in full; with
+  `--elevation gpx`, every change is summed as before.
+
+## Elevation from the terrain model
+
+A planned route's GPX elevations are usually smoothed map data: summits are
+cut off and short climbs, especially on coastal paths, disappear. By
+default the tool therefore replaces them with heights from the IGN
+(Instituto Geográfico Nacional) MDT05 digital terrain model of Spain, with
+5 m cells:
+
+- **Sampling**: the route is densified to a point every 5 m along each
+  straight segment, the terrain height is looked up at each point (bilinear
+  interpolation), and a 25 m median damps single-cell jumps where the route
+  line runs along a cliff edge or crosses a bridge the model has removed
+  (it shows bare ground).
+- **Service**: the public WCS service
+  `servicios.idee.es/wcs-inspire/mdt`, coverage `Elevacion4258_5`, in
+  tiles of 0.02° (about 2 km, roughly 1.4 MB each) requested as ESRI
+  ASCII grid, which keeps decimal heights (the GeoTIFF output is whole
+  metres only).
+- **Caching**: tiles are saved as `maps/mdt05/mdt05_<lat>_<lon>.asc` next
+  to the input file and reused by every route that crosses them. The
+  terrain doesn't change, so `--no-cache` doesn't re-download them; delete
+  the folder to fetch them again.
+- **Fallback**: if any point lies outside the model's coverage, or the
+  service can't be reached, the whole route uses the GPX file's own
+  elevations (mixing two sources with different height references would
+  put false steps in the profile), and the console says so.
+- **Checked against recorded walks**: on 11 GR92 stages, terrain-model
+  ascent matched the Apple Watch's barometric ascent with no overall bias
+  and a typical difference of about 5% per stage (at most 13%), where the
+  planned GPX elevations read about 20% low on average and up to 45% low
+  on a single stage. The terrain-adjusted moving time stayed within about
+  3% of the recorded moving time on average, without recalibration.
+
+Since the route is densified, the HTML profile draws at most one segment
+per horizontal pixel to keep the file size in check.
 
 ## Duration models
 
@@ -163,6 +205,14 @@ values) come from running this against one recorded GR92 stage and are
 hardcoded, not re-derived at run time — recalibrating against further
 recorded tracks (ideally covering more surface types, since this one
 track had little rough/loose or scree terrain) would refine them further.
+
+`RouteCalibrator.groovy` still reads the planned route's own GPX
+elevations, which is what the slope anchors were calibrated against. On
+the 11 recorded GR92 stages, the same anchors applied to terrain-model
+elevations predicted moving time slightly better than before (within about
+3% on average), so they were kept, but a future calibration run should use
+terrain-model elevations so it measures the same profile the profiler now
+uses.
 
 ## Difficulty ratings
 

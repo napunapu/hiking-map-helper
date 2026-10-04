@@ -25,6 +25,11 @@ Worth investigating:
   with a high inferred-surface rate, to see whether the calibrated eta
   values from `gpx/GR92-etappi17.gpx` (which had much better OSM coverage)
   still hold up.
+- `RouteCalibrator.groovy` still reads the planned route's own GPX
+  elevations, while `ElevationProfiler.groovy` now defaults to the IGN
+  MDT05 terrain model; a future calibration run should use the same
+  terrain-model profile (the current slope anchors held up on it within
+  about 3% of recorded moving time, so this isn't urgent).
 - `RouteCalibrator.groovy` still uses its own older, simpler surface
   classification (`inferSurfaceFromHighway`, a 3-bucket firm/standard/rough
   split) and was not updated to match `ElevationProfiler.groovy`'s new
