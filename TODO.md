@@ -72,3 +72,15 @@ effort), the thermal pace penalty made moving-time predictions worse (mean
 +9% against +1% without it), and neither peak air temperature nor full-sun
 felt heat (UTCI) along the route correlated with actual pace (r = 0.00 and
 0.01). Removing or weakening it is pending a decision.
+
+## Notes on how each walk felt
+
+For every recorded walk with FIT and GPX files, keep a short note (a
+sentence or a few) on how the walk felt - tiredness, heat, knees on the
+descents, pace, anything unusual - and show it in `WalkAnalyser.groovy`'s
+report next to the measured figures. Subjective effort is the missing
+check on the heart-rate and flat equivalent figures, and it would flag
+walks to treat as outliers (like the all-out 15 September walk). One
+option is a plain-text or Markdown note next to each FIT file with the
+same name, kept under the gitignored `gpx/real_world/` with the walks.
+
