@@ -1,17 +1,26 @@
 #!/usr/bin/env groovy
 @Grab('info.picocli:picocli:4.7.5')
+@Grab('com.garmin:fit:21.176.0')
 import picocli.CommandLine
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
 
+import com.garmin.fit.Decode
+import com.garmin.fit.MesgBroadcaster
+import com.garmin.fit.RecordMesg
+import com.garmin.fit.RecordMesgListener
 import groovy.xml.XmlSlurper
 import groovy.json.JsonSlurper
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
 import java.time.Instant
 
 @Command(
     name = 'RouteCalibrator',
-    description = 'Compares a planned GPX route against a recorded real-world GPX track and suggests calibrated model coefficients.',
+    description = 'Compares a planned GPX route against a recorded real-world track (FIT or GPX) and suggests calibrated model coefficients.',
     mixinStandardHelpOptions = true,
     version = '1.0'
 )
@@ -20,8 +29,8 @@ class Options {
     @Parameters(index = '0', description = 'Planned route GPX file')
     File plannedGpx
 
-    @Parameters(index = '1', description = 'Recorded (actual) GPX file, with per-point <time>')
-    File recordedGpx
+    @Parameters(index = '1', description = 'Recorded (actual) track: a FIT file (with its same-named GPX export next to it for full-precision altitude), or a GPX file with per-point <time>')
+    File recordedTrack
 
     @Option(names = ['-c', '--osm-cache'], description = 'Path to a cached Overpass OSM JSON response for the planned route (default: auto-detected as maps/<plannedBaseName>.osm.json next to the planned GPX, or a sibling <plannedBaseName>.osm.json)')
     String osmCachePath
@@ -34,9 +43,161 @@ class Options {
 
     @Option(names = ['--break'], description = 'Modelled rest-break cadence as interval:duration in minutes, compared against the actual observed pauses (default: 60:5)')
     String breakSpec = '60:5'
+
+    @Option(names = ['--elevation'], description = 'Planned-route elevation source, as in ElevationProfiler.groovy: "terrain" (IGN MDT05 terrain model, Spain only; falls back to the GPX if unavailable) or "gpx" (default: terrain)')
+    String elevationSource = 'terrain'
+
+    @Option(names = ['--no-terrain-start'], description = 'Don\'t correct the recorded track\'s barometer start error against the IGN MDT05 terrain model')
+    boolean noTerrainStart = false
+
+    @Option(names = ['--fit-altitude'], description = 'Use a FIT file\'s own altitudes (0.2 m steps) even when a GPX export sits next to it')
+    boolean fitAltitude = false
 }
 
 // ----- shared model functions, mirrored from ElevationProfiler.groovy for consistency -----
+
+// IGN MDT05 digital terrain model (5 m cells, Spain only), fetched from the public WCS
+// service in 0.02 degree tiles (about 2 km, ~1.4 MB each) and cached as files, since the
+// terrain doesn't change. Tiles are requested as ESRI ASCII grid rather than GeoTIFF,
+// because the GeoTIFF output is whole metres only. The model is bare ground: buildings,
+// bridges and embankments are removed.
+class TerrainModel {
+    static final String WCS_URL_TEMPLATE = 'https://servicios.idee.es/wcs-inspire/mdt?SERVICE=WCS&REQUEST=GetCoverage' +
+        '&VERSION=2.0.1&COVERAGEID=Elevacion4258_5&SUBSET=lat(%.4f,%.4f)&SUBSET=long(%.4f,%.4f)&FORMAT=application/asc'
+    static final double TILE_DEG = 0.02
+
+    File cacheDir
+    int downloadedCount = 0
+    private Map<String, Map> tiles = [:]
+
+    TerrainModel(File cacheDir) {
+        this.cacheDir = cacheDir
+    }
+
+    // Terrain height at a position by bilinear interpolation between cell centres, or NaN
+    // where the model has no data (outside Spain, or open sea).
+    double height(double lat, double lon) {
+        long latIndex = (long) Math.floor(lat / TILE_DEG + 1e-9)
+        long lonIndex = (long) Math.floor(lon / TILE_DEG + 1e-9)
+        Map tile = tileAt(latIndex * TILE_DEG, lonIndex * TILE_DEG)
+        double cell = tile.cellsize as double
+        int nrows = tile.nrows as int
+        int ncols = tile.ncols as int
+        double[] grid = tile.grid as double[]
+        // Row 0 is the northern edge.
+        double top = (tile.yllcorner as double) + nrows * cell
+        double x = (lon - (tile.xllcorner as double)) / cell - 0.5
+        double y = (top - lat) / cell - 0.5
+        int x0 = Math.min(Math.max((int) Math.floor(x), 0), ncols - 2)
+        int y0 = Math.min(Math.max((int) Math.floor(y), 0), nrows - 2)
+        double fx = x - x0
+        double fy = y - y0
+        double north = grid[y0 * ncols + x0] * (1 - fx) + grid[y0 * ncols + x0 + 1] * fx
+        double south = grid[(y0 + 1) * ncols + x0] * (1 - fx) + grid[(y0 + 1) * ncols + x0 + 1] * fx
+        north * (1 - fy) + south * fy
+    }
+
+    private Map tileAt(double lat0, double lon0) {
+        String name = String.format(Locale.ROOT, 'mdt05_%.2f_%.2f.asc', lat0, lon0)
+        if (tiles.containsKey(name)) {
+            return tiles[name]
+        }
+        File file = new File(cacheDir, name)
+        if (!file.exists()) {
+            String url = String.format(Locale.ROOT, WCS_URL_TEMPLATE, lat0, lat0 + TILE_DEG, lon0, lon0 + TILE_DEG)
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
+            HttpRequest request = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(180)).GET().build()
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString())
+            if (response.statusCode() != 200 || !response.body().contains('ncols')) {
+                throw new RuntimeException("terrain tile ${name} request failed with HTTP ${response.statusCode()}")
+            }
+            cacheDir.mkdirs()
+            file.text = response.body()
+            downloadedCount++
+        }
+        Map tile = parseAsciiGrid(file.text)
+        tiles[name] = tile
+        tile
+    }
+
+    // Parses an ESRI ASCII grid, skipping the multipart wrapper the WCS adds before it and the
+    // further sections (.prj) after it - only nrows x ncols values are read.
+    private static Map parseAsciiGrid(String text) {
+        List<String> lines = text.substring(text.indexOf('ncols')).readLines()
+        Map header = [:]
+        int lineIndex = 0
+        while (lineIndex < lines.size() && lines[lineIndex] && Character.isLetter(lines[lineIndex].charAt(0))) {
+            String[] parts = lines[lineIndex].trim().split(/\s+/)
+            header[parts[0].toLowerCase()] = parts[1] as double
+            lineIndex++
+        }
+        int nrows = header.nrows as int
+        int ncols = header.ncols as int
+        Double nodata = header.nodata_value as Double
+        double[] grid = new double[nrows * ncols]
+        int n = 0
+        for (int i = lineIndex; i < lines.size() && n < grid.length; i++) {
+            for (String token : lines[i].trim().split(/\s+/)) {
+                if (token && n < grid.length) {
+                    double value = token as double
+                    grid[n++] = (nodata != null && value == nodata) ? Double.NaN : value
+                }
+            }
+        }
+        [nrows: nrows, ncols: ncols, cellsize: header.cellsize, xllcorner: header.xllcorner, yllcorner: header.yllcorner, grid: grid]
+    }
+}
+
+// Inserts points along each straight segment so that no two are more than stepM apart,
+// interpolating position and the GPX's own elevation. A planned route's points can be 20-30 m
+// apart, so without this, short climbs between them disappear from a terrain-model profile.
+List<Map> densifyRoute(List<Map> points, double stepM) {
+    List<Map> dense = [points[0].clone() as Map]
+    for (int i = 1; i < points.size(); i++) {
+        Map a = points[i - 1]
+        Map b = points[i]
+        double d = haversine(a.lat as double, a.lon as double, b.lat as double, b.lon as double)
+        int steps = Math.max(1, (int) Math.ceil(d / stepM))
+        for (int s = 1; s <= steps; s++) {
+            double f = s / (double) steps
+            dense << [
+                lat: (a.lat as double) + ((b.lat as double) - (a.lat as double)) * f,
+                lon: (a.lon as double) + ((b.lon as double) - (a.lon as double)) * f,
+                ele: (a.ele as double) + ((b.ele as double) - (a.ele as double)) * f
+            ]
+        }
+    }
+    dense
+}
+
+List<Double> rollingMedian(List<Double> values, int half) {
+    int n = values.size()
+    List<Double> result = new ArrayList<>(n)
+    for (int i = 0; i < n; i++) {
+        List<Double> window = values.subList(Math.max(0, i - half), Math.min(n, i + half + 1)).sort(false)
+        result << window[window.size().intdiv(2)]
+    }
+    result
+}
+
+// Replaces each point's elevation with the terrain model's, after densifying the route to
+// the model's 5 m cell size. A 25 m median damps single-cell jumps where the route line
+// runs along a cliff edge or crosses a removed bridge. Returns null (leaving the caller on
+// the GPX elevations) if any point lies outside the model's coverage, since mixing two
+// sources with different height references would put false steps in the profile.
+List<Map> applyTerrainElevation(List<Map> points, TerrainModel terrain) {
+    List<Map> dense = densifyRoute(points, 5.0)
+    List<Double> heights = dense.collect { terrain.height(it.lat as double, it.lon as double) }
+    if (heights.any { Double.isNaN(it) }) {
+        return null
+    }
+    List<Double> damped = rollingMedian(heights, 2)
+    for (int i = 0; i < dense.size(); i++) {
+        dense[i].ele = damped[i]
+    }
+    dense
+}
+
 
 double haversine(double lat1, double lon1, double lat2, double lon2) {
     double earthRadiusM = 6371000.0
@@ -172,35 +333,73 @@ List<Map> parseOsmWays(Map osmData) {
     }
 }
 
-Map nearestWayInfo(double plat, double plon, List<Map> ways, double thresholdM) {
-    double latPad = thresholdM / 110540.0
-    double lonPad = thresholdM / (111320.0 * Math.cos(Math.toRadians(plat)))
-
-    double bestDist = Double.MAX_VALUE
-    Map bestTags = null
-
+// Grid index over every way segment, so snapping a point only checks segments in nearby
+// cells rather than every segment in the bounding box - needed once a terrain-model route is
+// densified to a point every 5 m. Segments keep their original way order, so the nearest
+// match (first strictly closest) is the same as a full scan would find.
+Map buildWaySegmentIndex(List<Map> ways, double cellDeg) {
+    List<double[]> segments = []
+    List<Map> segmentTags = []
+    Map<Long, List<Integer>> cells = [:]
     for (way in ways) {
         List<Map> geom = way.geom as List<Map>
         for (int i = 1; i < geom.size(); i++) {
-            Map a = geom[i - 1]
-            Map b = geom[i]
-            double aLat = a.lat as double
-            double aLon = a.lon as double
-            double bLat = b.lat as double
-            double bLon = b.lon as double
+            double[] seg = [geom[i - 1].lat as double, geom[i - 1].lon as double, geom[i].lat as double, geom[i].lon as double] as double[]
+            int segIndex = segments.size()
+            segments << seg
+            segmentTags << (way.tags as Map)
+            long r0 = (long) Math.floor(Math.min(seg[0], seg[2]) / cellDeg)
+            long r1 = (long) Math.floor(Math.max(seg[0], seg[2]) / cellDeg)
+            long c0 = (long) Math.floor(Math.min(seg[1], seg[3]) / cellDeg)
+            long c1 = (long) Math.floor(Math.max(seg[1], seg[3]) / cellDeg)
+            for (long r = r0; r <= r1; r++) {
+                for (long c = c0; c <= c1; c++) {
+                    cells.computeIfAbsent(r * 10000000L + c) { [] } << segIndex
+                }
+            }
+        }
+    }
+    [cellDeg: cellDeg, segments: segments, segmentTags: segmentTags, cells: cells]
+}
 
-            if (Math.min(aLat, bLat) - latPad > plat || Math.max(aLat, bLat) + latPad < plat) {
-                continue
-            }
-            if (Math.min(aLon, bLon) - lonPad > plon || Math.max(aLon, bLon) + lonPad < plon) {
-                continue
-            }
+Map nearestWayInfo(double plat, double plon, Map wayIndex, double thresholdM) {
+    double latPad = thresholdM / 110540.0
+    double lonPad = thresholdM / (111320.0 * Math.cos(Math.toRadians(plat)))
+    double cellDeg = wayIndex.cellDeg as double
+    Map<Long, List<Integer>> cells = wayIndex.cells as Map<Long, List<Integer>>
+    List<double[]> segments = wayIndex.segments as List<double[]>
 
-            double d = pointToSegmentDistanceM(plat, plon, aLat, aLon, bLat, bLon)
-            if (d < bestDist) {
-                bestDist = d
-                bestTags = way.tags as Map
+    // Candidate segments from every cell the point's search box touches, in original order.
+    TreeSet<Integer> candidates = new TreeSet<>()
+    for (long r = (long) Math.floor((plat - latPad) / cellDeg); r <= (long) Math.floor((plat + latPad) / cellDeg); r++) {
+        for (long c = (long) Math.floor((plon - lonPad) / cellDeg); c <= (long) Math.floor((plon + lonPad) / cellDeg); c++) {
+            List<Integer> cell = cells.get(r * 10000000L + c)
+            if (cell) {
+                candidates.addAll(cell)
             }
+        }
+    }
+
+    double bestDist = Double.MAX_VALUE
+    Map bestTags = null
+    for (int segIndex : candidates) {
+        double[] seg = segments[segIndex]
+        double aLat = seg[0]
+        double aLon = seg[1]
+        double bLat = seg[2]
+        double bLon = seg[3]
+
+        if (Math.min(aLat, bLat) - latPad > plat || Math.max(aLat, bLat) + latPad < plat) {
+            continue
+        }
+        if (Math.min(aLon, bLon) - lonPad > plon || Math.max(aLon, bLon) + lonPad < plon) {
+            continue
+        }
+
+        double d = pointToSegmentDistanceM(plat, plon, aLat, aLon, bLat, bLon)
+        if (d < bestDist) {
+            bestDist = d
+            bestTags = wayIndex.segmentTags[segIndex] as Map
         }
     }
 
@@ -338,12 +537,155 @@ List<Map> parseRecordedGpx(File file) {
     points
 }
 
+// ----- recorded FIT tracks, mirrored from WalkAnalyser.groovy -----
+
+// The GPX export with the same name as a FIT file. Apple Watch names contain a non-breaking
+// space ("Apple\u00a0Watch") that a re-export or rename can turn into a normal one, so names
+// are compared with all whitespace normalised.
+File matchingGpx(File fitFile) {
+    Closure<String> stem = { String name -> name.replaceFirst(/(?i)\.(fit|gpx)$/, '').replaceAll(/[\s\u00a0]+/, ' ') }
+    String wanted = stem(fitFile.name)
+    fitFile.absoluteFile.parentFile.listFiles()?.find { it.name.toLowerCase().endsWith('.gpx') && stem(it.name) == wanted }
+}
+
+// Loads a FIT file's positioned records as recorded points with the watch's own distance.
+// Altitude comes from the same-named GPX export, matched by timestamp, when there is one: the
+// FIT format rounds altitude to 0.2 m steps, which inflates ascent and steepens 1 Hz grades.
+Map parseRecordedFit(File fitFile, boolean useGpxAltitude) {
+    double semicircleToDeg = 180.0 / Math.pow(2, 31)
+    List<Map> points = []
+    Double lastDistance = 0.0d
+    Decode decode = new Decode()
+    MesgBroadcaster broadcaster = new MesgBroadcaster(decode)
+    broadcaster.addListener({ RecordMesg m ->
+        if (m.distance != null) {
+            lastDistance = m.distance as double
+        }
+        Float altitude = m.enhancedAltitude ?: m.altitude
+        if (m.positionLat != null && m.positionLong != null && altitude != null) {
+            points << [lat: m.positionLat * semicircleToDeg, lon: m.positionLong * semicircleToDeg, ele: altitude as double,
+                       time: m.timestamp.date.toInstant(), distance: lastDistance]
+        }
+    } as RecordMesgListener)
+    fitFile.withInputStream { decode.read(it, broadcaster, broadcaster) }
+
+    String altitudeSource = 'FIT (0.2 m steps)'
+    File gpxFile = useGpxAltitude ? matchingGpx(fitFile) : null
+    if (gpxFile) {
+        Map<Long, Double> gpxAltitudes = [:]
+        new XmlSlurper(false, false).parse(gpxFile).trk.trkseg.trkpt.each { trkpt ->
+            if (trkpt.time.text() && trkpt.ele.text()) {
+                gpxAltitudes[Instant.parse(trkpt.time.text()).epochSecond] = trkpt.ele.text() as double
+            }
+        }
+        int matched = 0
+        points.each { p ->
+            Double gpxAltitude = gpxAltitudes[(p.time as Instant).epochSecond]
+            if (gpxAltitude != null) {
+                p.ele = gpxAltitude
+                matched++
+            }
+        }
+        if (matched > 0) {
+            altitudeSource = "GPX export (${matched} of ${points.size()} records), FIT distance"
+        }
+    }
+    [points: points, altitudeSource: altitudeSource]
+}
+
+// Median ignoring NaN (missing terrain), averaging the two middle values of an even count.
+double nanMedian(List<Double> values) {
+    List<Double> sorted = values.findAll { !Double.isNaN(it) }.sort(false)
+    int n = sorted.size()
+    if (n == 0) {
+        return Double.NaN
+    }
+    n % 2 == 1 ? sorted[n.intdiv(2)] : (sorted[n.intdiv(2) - 1] + sorted[n.intdiv(2)]) / 2.0
+}
+
+List<Double> rollingNanMedian(List<Double> values, int half) {
+    int n = values.size()
+    List<Double> result = new ArrayList<>(n)
+    for (int i = 0; i < n; i++) {
+        result << nanMedian(values.subList(Math.max(0, i - half), Math.min(n, i + half + 1)))
+    }
+    result
+}
+
+double interpolateAt(List<Double> xs, List<Double> ys, double x) {
+    if (x <= xs[0]) {
+        return ys[0]
+    }
+    if (x >= xs[-1]) {
+        return ys[-1]
+    }
+    int hi = Collections.binarySearch(xs, x)
+    if (hi >= 0) {
+        return ys[hi]
+    }
+    hi = -hi - 1
+    double f = (x - xs[hi - 1]) / (xs[hi] - xs[hi - 1])
+    ys[hi - 1] + (ys[hi] - ys[hi - 1]) * f
+}
+
+// The barometer start correction, with WalkAnalyser.groovy's rules (see estimateStartError
+// there): the watch's steady offset from terrain is measured beyond the first 2 km, and until
+// the watch first comes within 2 m of terrain plus that offset its altitude is replaced by that
+// reference, blending back over the last 50 m. Points need lat, lon, ele and cumulative
+// distance. Returns the correction applied, or null.
+Map correctRecordedStart(List<Map> points, TerrainModel terrain) {
+    double settledFromM = 2000.0
+    double settledWithinM = 2.0
+    if ((points[-1].distance as double) <= settledFromM) {
+        return null
+    }
+    List<Map> sampled = []
+    double nextDistance = 0.0
+    for (Map p : points) {
+        if ((p.distance as double) >= nextDistance) {
+            sampled << p
+            nextDistance = (p.distance as double) + 5.0
+        }
+    }
+    List<Double> dist = sampled.collect { it.distance as double }
+    List<Double> dem = rollingNanMedian(sampled.collect { terrain.height(it.lat as double, it.lon as double) }, 2)
+    List<Double> watch = sampled.collect { it.ele as double }
+    double settledOffset = nanMedian((0..<sampled.size()).findAll { dist[it] >= settledFromM }.collect { watch[it] - dem[it] })
+    if (Double.isNaN(settledOffset) || Double.isNaN(dem[0])) {
+        return null
+    }
+    List<Double> reference = dem.collect { it + settledOffset }
+    List<Double> error = rollingNanMedian((0..<sampled.size()).collect { watch[it] - reference[it] }, 2)
+    double startError = (points[0].ele as double) - reference[0]
+    if (Math.abs(startError) < settledWithinM) {
+        return null
+    }
+    Integer settleIndex = (0..<sampled.size()).find { dist[it] > 0 && dist[it] < settledFromM && !Double.isNaN(error[it]) && Math.abs(error[it]) < settledWithinM }
+    if (settleIndex == null) {
+        return null
+    }
+    double settleM = dist[settleIndex]
+    double blend = Math.min(50.0, settleM)
+    double blendFrom = settleM - blend
+    for (Map p : points) {
+        double d = p.distance as double
+        if (d >= settleM) {
+            break
+        }
+        double ref = interpolateAt(dist, reference, d)
+        if (!Double.isNaN(ref)) {
+            p.ele = d <= blendFrom ? ref : ref * (1 - (d - blendFrom) / blend) + (p.ele as double) * ((d - blendFrom) / blend)
+        }
+    }
+    [startError: startError, settleM: settleM]
+}
+
 // ----- planned-route model (mirrors ElevationProfiler.groovy's terrain+thermal model) -----
 
 // Builds the planned route's own per-point distance, smoothed elevation, windowed-baseline
 // grade (matching ElevationProfiler's 10 m minimum baseline, to avoid GPS-cluster spikes),
 // OSM-derived surface/SAC/eta/T-factor, and the model's predicted per-segment speed/time.
-Map buildPlannedModel(List<Map> points, List<Map> osmWays, double speedKmh, double tempCelsius) {
+Map buildPlannedModel(List<Map> points, List<Map> osmWays, double speedKmh, double tempCelsius, double ascentThresholdM) {
     List<Double> smoothedEle = movingAverage(points.collect { it.ele as double }, 5)
     for (int i = 0; i < points.size(); i++) {
         points[i].smoothedEle = smoothedEle[i]
@@ -358,8 +700,9 @@ Map buildPlannedModel(List<Map> points, List<Map> osmWays, double speedKmh, doub
     }
 
     double surfaceSnapThresholdM = 30.0
+    Map wayIndex = buildWaySegmentIndex(osmWays, 0.001)
     for (int i = 0; i < points.size(); i++) {
-        Map wayInfo = nearestWayInfo(points[i].lat as double, points[i].lon as double, osmWays, surfaceSnapThresholdM)
+        Map wayInfo = nearestWayInfo(points[i].lat as double, points[i].lon as double, wayIndex, surfaceSnapThresholdM)
         points[i].surface = wayInfo.surface
         points[i].sacScale = wayInfo.sacScale
         points[i].eta = terrainFactorForSurface(wayInfo.surface as String)
@@ -384,12 +727,18 @@ Map buildPlannedModel(List<Map> points, List<Map> osmWays, double speedKmh, doub
     points[0].predictedCumTimeNoThermalHours = 0.0
     int gradeRef = 0
 
+    // Ascent/descent hysteresis, as in ElevationProfiler.groovy: 0.5 m on a terrain-model
+    // profile, 0 (every change summed) on the GPX's own elevations.
+    double ascentReferenceEle = points[0].smoothedEle as double
     for (int i = 1; i < points.size(); i++) {
-        double deltaEle = (points[i].smoothedEle as double) - (points[i - 1].smoothedEle as double)
-        if (deltaEle > 0) {
-            totalAscent += deltaEle
-        } else {
-            totalDescent += -deltaEle
+        double eleChange = (points[i].smoothedEle as double) - ascentReferenceEle
+        if (Math.abs(eleChange) >= ascentThresholdM) {
+            if (eleChange > 0) {
+                totalAscent += eleChange
+            } else {
+                totalDescent += -eleChange
+            }
+            ascentReferenceEle = points[i].smoothedEle as double
         }
 
         while (gradeRef < i - 1 && (points[i].distance as double) - (points[gradeRef + 1].distance as double) >= minGradeBaselineM) {
@@ -440,13 +789,9 @@ Map buildRecordedMetrics(List<Map> points) {
         points[i].smoothedEle = smoothedEle[i]
     }
 
-    double cumulative = 0.0
-    points[0].distance = 0.0
-    for (int i = 1; i < points.size(); i++) {
-        double d = haversine(points[i - 1].lat as double, points[i - 1].lon as double, points[i].lat as double, points[i].lon as double)
-        cumulative += d
-        points[i].distance = cumulative
-    }
+    // Distance is already set: the watch's own from a FIT file, or summed from positions for a
+    // GPX (see assignRecordedDistances).
+    double cumulative = points[-1].distance as double
 
     double totalMovingTimeHours = 0.0
     double totalPauseTimeHours = 0.0
@@ -509,6 +854,19 @@ Map buildRecordedMetrics(List<Map> points) {
         totalPauseTimeHours: totalPauseTimeHours, totalElapsedHours: totalElapsedHours,
         breakEvents: breakEvents
     ]
+}
+
+// Cumulative distance from positions, for a recorded GPX without the watch's own distance.
+void assignRecordedDistances(List<Map> points) {
+    if (points.every { it.distance != null }) {
+        return
+    }
+    double cumulative = 0.0
+    points[0].distance = 0.0d
+    for (int i = 1; i < points.size(); i++) {
+        cumulative += haversine(points[i - 1].lat as double, points[i - 1].lon as double, points[i].lat as double, points[i].lon as double)
+        points[i].distance = cumulative
+    }
 }
 
 // Snaps each recorded point to the nearest point (by index) on the planned route, using a
@@ -574,8 +932,8 @@ if (!options.plannedGpx.exists()) {
     System.err.println("Planned GPX file not found: ${options.plannedGpx}")
     System.exit(1)
 }
-if (!options.recordedGpx.exists()) {
-    System.err.println("Recorded GPX file not found: ${options.recordedGpx}")
+if (!options.recordedTrack.exists()) {
+    System.err.println("Recorded track not found: ${options.recordedTrack}")
     System.exit(1)
 }
 
@@ -591,7 +949,7 @@ double modelledBreakDurationHours = (breakSpecParsed.durationMin as int) / 60.0
 
 println '=== RouteCalibrator ==='
 println "Planned route  : ${options.plannedGpx}"
-println "Recorded track : ${options.recordedGpx}"
+println "Recorded track : ${options.recordedTrack}"
 
 // Locate the OSM cache: explicit override, else maps/<name>.osm.json (ElevationProfiler's
 // convention), else a plain sibling <name>.osm.json next to the planned GPX.
@@ -619,12 +977,49 @@ if (plannedPoints.size() < 2) {
     System.err.println('Planned GPX file must contain at least two track points.')
     System.exit(1)
 }
-Map plannedModel = buildPlannedModel(plannedPoints, osmWays, options.speedKmh, options.tempCelsius)
+// Planned-route elevation, as in ElevationProfiler.groovy: the terrain model by default,
+// since a planned route's GPX elevations are usually smoothed map data.
+File mapsDir = new File(options.plannedGpx.absoluteFile.parentFile, 'maps')
+TerrainModel terrain = new TerrainModel(new File(mapsDir, 'mdt05'))
+boolean plannedFromTerrain = false
+if (options.elevationSource == 'terrain') {
+    try {
+        List<Map> terrainPoints = applyTerrainElevation(plannedPoints, terrain)
+        if (terrainPoints) {
+            plannedPoints = terrainPoints
+            plannedFromTerrain = true
+        } else {
+            System.err.println('Planned route leaves the IGN MDT05 coverage (Spain only); using its GPX elevations.')
+        }
+    } catch (Exception ex) {
+        System.err.println("IGN MDT05 terrain model unavailable (${ex.message}); using the planned GPX elevations.")
+    }
+}
+println "Planned elevation: ${plannedFromTerrain ? 'IGN MDT05 terrain model (every 5 m)' : 'GPX file'}"
+Map plannedModel = buildPlannedModel(plannedPoints, osmWays, options.speedKmh, options.tempCelsius, plannedFromTerrain ? 0.5 : 0.0)
 
-List<Map> recordedPoints = parseRecordedGpx(options.recordedGpx)
+List<Map> recordedPoints
+if (options.recordedTrack.name.toLowerCase().endsWith('.fit')) {
+    Map loaded = parseRecordedFit(options.recordedTrack, !options.fitAltitude)
+    recordedPoints = loaded.points as List<Map>
+    println "Recorded altitude: ${loaded.altitudeSource}"
+} else {
+    recordedPoints = parseRecordedGpx(options.recordedTrack)
+}
 if (recordedPoints.size() < 2) {
-    System.err.println('Recorded GPX file must contain at least two timestamped track points.')
+    System.err.println('Recorded track must contain at least two timestamped, positioned points.')
     System.exit(1)
+}
+assignRecordedDistances(recordedPoints)
+if (!options.noTerrainStart) {
+    try {
+        Map correction = correctRecordedStart(recordedPoints, terrain)
+        println correction
+            ? String.format(Locale.ROOT, 'Start corrected: watch read %+.0f m against terrain, settling over %.0f m', correction.startError as double, correction.settleM as double)
+            : 'Start checked against terrain: no settling error found, not corrected'
+    } catch (Exception ex) {
+        System.err.println("IGN MDT05 terrain model unavailable (${ex.message}); recorded start not corrected.")
+    }
 }
 Map recordedModel = buildRecordedMetrics(recordedPoints)
 snapRecordedToPlanned(recordedPoints, plannedPoints)

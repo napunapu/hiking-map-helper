@@ -191,9 +191,25 @@ and persist.
 ## Calibrating the duration model
 
 `RouteCalibrator.groovy`, a separate standalone script in this repository,
-compares a planned route GPX against a recorded real-world GPX track (e.g.
-an Apple Watch export) and derives calibrated values for `base_speed`,
-`slope_factor` and `eta` via a staged, three-step residual solver:
+compares a planned route GPX against a recorded real-world track and
+derives calibrated values for `base_speed`, `slope_factor` and `eta` via a
+staged, three-step residual solver:
+
+```sh
+groovy RouteCalibrator.groovy <planned.gpx> <recorded.fit|recorded.gpx> [-s <speed>] [--elevation <terrain|gpx>] [--no-terrain-start] [--fit-altitude]
+```
+
+The recorded track is best given as an Apple Watch FIT file exported from
+HealthFit, with its GPX export next to it: as in `WalkAnalyser.groovy`
+(see "Analysing recorded walks" below), altitude then comes from the GPX at
+full precision, matched by timestamp, distance is the watch's own, and the
+barometer's start error is corrected against the IGN MDT05 terrain model
+(`--no-terrain-start` turns it off). A plain GPX with per-point times still
+works, with distance summed from positions. The planned route takes its
+elevations from the terrain model by default, as in the profiler
+(`--elevation gpx` for the GPX's own). Stretches of the recorded track more
+than 40 m from the planned route, such as a scenic detour or a corrected
+route, are treated as real course changes and left out of the comparison.
 
 1. **Baseline flat speed** — the median recorded speed on firm-surface,
    -3% to +3% grade segments, locked as `v_base`.
@@ -552,7 +568,10 @@ effect comes from the thermal pace penalty above.
 
 By default (`--break 60:5`), the simulation inserts a 5-minute rest every
 60 minutes of *moving* time — pass `--break 0:0` to disable, or e.g.
-`--break 45:10` for a 10-minute break every 45 minutes.
+`--break 45:10` for a 10-minute break every 45 minutes. The default is meant
+for an average walker; on 10 recorded GR92 walks, one walker stopped for
+about 13 minutes per hour of walking in all (typically 3-4 breaks of 8-10
+minutes plus short pauses), so `--break 60:13` would match that habit.
 
 - **Dual clock**: moving time (pure locomotion) and elapsed/wall-clock time
   (moving *plus* pauses) are tracked separately. Breaks are triggered by
