@@ -1417,7 +1417,8 @@ double minettiWalkingRelative(double gradeFraction) {
 }
 
 java.io.File resolveMapsDir(java.io.File input, java.io.File explicit) {
-    if (explicit) {
+    // Not "if (explicit)": Groovy counts a folder that doesn't exist yet as false.
+    if (explicit != null) {
         return explicit
     }
     java.io.File here = new java.io.File(input.absoluteFile.parentFile, 'maps')
@@ -2301,7 +2302,8 @@ if (summaries.size() > 1) {
 
 if (summaries && !options.noReport) {
     java.io.File first = options.files.find { it.exists() }.absoluteFile
-    java.io.File target = options.reportFile ?: new java.io.File(first.parentFile, lang == 'en' ? 'walk-report.md' : "walk-report.${lang}.md")
+    // An explicit null check: Groovy counts a File that doesn't exist yet as false.
+    java.io.File target = options.reportFile != null ? options.reportFile : new java.io.File(first.parentFile, lang == 'en' ? 'walk-report.md' : "walk-report.${lang}.md")
     target.setText(markdownReport(summaries.size()), 'UTF-8')
     println ''
     println tr('report.written', target.path)
