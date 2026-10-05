@@ -22,7 +22,9 @@ which is gitignored — not tracked in this repository.
 
 ## Language and tone
 
+- Always follow the European Commission's DGT English Style Guide; the rules that matter here are summarised in `docs/style-guide.md` (numbers, units, dates, times, dashes, and the Finnish equivalents). Read it before writing user-facing text.
 - Use British English in all comments, READMEs and documentation (e.g. "colour", "organised", "behaviour").
+- `WalkAnalyser.groovy` reports in English and Finnish (`--language`): every user-facing string goes in both `MESSAGES` maps, and numbers go through its formatting helpers.
 - Use sentence case for titles and headings — capitalise only the first word and proper nouns.
 
 ## Markdown

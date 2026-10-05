@@ -31,6 +31,16 @@ Worth investigating:
   five-tier hierarchy — worth reconciling so a future calibration run is
   measuring the same surface model the profiler actually uses.
 
+## Bring older text in line with the style guide
+
+`docs/style-guide.md` (the DGT English Style Guide, plus Finnish) now
+governs all text. `WalkAnalyser.groovy` follows it, but `README.md`,
+`ElevationProfiler.groovy`'s HTML output and console messages, and
+`RouteCalibrator.groovy` predate it: hyphens instead of en dashes in
+ranges (0-5%), `degC`, comma thousands separators and the like. Worth one
+sweep, and possibly localising the profiler's HTML into Finnish the same
+way as the analyser.
+
 ## Recalibrate for rough/loose terrain
 
 `RouteCalibrator.groovy`'s one calibration run so far (etappi17) had almost
