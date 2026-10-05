@@ -250,7 +250,7 @@ on an Apple Watch and exported from HealthFit as FIT plus GPX with the
 same name:
 
 ```sh
-groovy WalkAnalyser.groovy [-l en|fi] [-t <m>] [--no-terrain-start] [--no-weather] [--no-highlights] [--redraft] [--fit-altitude] [--maps <dir>] <walk.fit> [...]
+groovy WalkAnalyser.groovy [-l en|fi] [-t <m>] [--no-terrain-start] [--no-weather] [--no-highlights] [--redraft] [-o <report.md>] [--no-report] [--fit-altitude] [--maps <dir>] <walk.fit> [...]
 ```
 
 The report is in English by default and in Finnish with `-l fi`
@@ -342,6 +342,14 @@ the analyser drafts both from:
 Drafts are never written over once checked (draft line removed);
 `--redraft` rewrites the ones still marked as drafts. `--no-highlights`
 skips the OpenStreetMap query and drafting, and only shows existing files.
+
+Besides printing to the console, the analyser combines everything into one
+Markdown report, `walk-report.md` (`walk-report.fi.md` in Finnish) next to
+the first input file, or wherever `-o` (`--report`) says; `--no-report`
+skips it. The report opens with the table of all walks, then gives each
+walk's notes and highlights followed by its figures and tables, and ends
+with the personal effort curve. It is personal data like the notes, so it
+stays under `gpx/`. The HTML profiles with diagrams stay separate.
 
 With several files, a final table compares the walks side by side. Its
 ascent, descent and steep figures reproduce the separate Python analyser

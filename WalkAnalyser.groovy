@@ -61,6 +61,12 @@ class Options {
     @Option(names = ['--redraft'], description = 'Rewrite highlight files that are still drafts (their draft line not yet removed); checked files are never overwritten')
     boolean redraft = false
 
+    @Option(names = ['-o', '--report'], description = 'Combined Markdown report of all walks: notes, highlights and figures (default: walk-report.md, or walk-report.fi.md in Finnish, next to the first input file)')
+    java.io.File reportFile
+
+    @Option(names = ['--no-report'], description = 'Don\'t write the combined Markdown report, only print to the console')
+    boolean noReport = false
+
     @Option(names = ['--maps'], description = 'Cache folder for terrain tiles, weather and OpenStreetMap features (default: the nearest existing maps/ folder next to the input file or one level up, otherwise maps/ next to the input file)')
     java.io.File mapsDir
 }
@@ -614,6 +620,10 @@ class ThermalComfort {
         'all.effort': 'Effort',
         'all.air': 'Air',
         'all.sunUtci': 'Sun UTCI',
+        'report.title': 'Recorded walks',
+        'report.intro': 'Report of %s recorded walks, written by WalkAnalyser on %s. Notes on how each walk felt and the highlights come from the notes and highlights files next to the FIT files; figures come from the recordings.',
+        'report.written': 'Report written to %s',
+        'label.file': 'File',
         'hl.draftHeader': '# Draft: best guess from OpenStreetMap and the recorded data – check, edit and delete this line.',
         'hl.route': 'Route: %s',
         'hl.item': 'km %s (%s): %s',
@@ -725,6 +735,10 @@ class ThermalComfort {
         'all.effort': 'Rasitus',
         'all.air': 'Ilma',
         'all.sunUtci': 'UTCI auringossa',
+        'report.title': 'Tallennetut kävelyt',
+        'report.intro': 'Raportti %s tallennetusta kävelystä, laadittu WalkAnalyserilla %s. Tuntumat ja kohokohdat ovat FIT-tiedostojen vieressä olevista muistiinpano- ja kohokohtatiedostoista, luvut tallenteista.',
+        'report.written': 'Raportti kirjoitettu: %s',
+        'label.file': 'Tiedosto',
         'hl.draftHeader': '# Luonnos (draft): paras arvaus OpenStreetMapin ja tallennettujen tietojen perusteella – tarkista, muokkaa ja poista tämä rivi.',
         'hl.route': 'Reitti: %s',
         'hl.item': 'km %s (klo %s): %s',
@@ -834,10 +848,45 @@ String formatHours(double hours) {
 }
 
 // The labels in front of each report line, padded to the longest in the current language.
-@Field final List<String> LABEL_KEYS = ['altitudeFrom', 'walk', 'howItFelt', 'highlights', 'startCorrected', 'distance', 'time',
+@Field final List<String> LABEL_KEYS = ['file', 'altitudeFrom', 'walk', 'howItFelt', 'highlights', 'startCorrected', 'distance', 'time',
     'ascentDescent', 'altitudeRange', 'heartRate', 'netBeats', 'zones', 'steps', 'energy', 'watchWeather', 'weather', 'sunshine', 'feltHeat']
 
+// Everything the report prints goes through the functions below, which print it to the
+// console and also keep it as blocks for the combined Markdown report (see writeReport). The
+// section says where a block belongs in that report: a walk, the effort curve or the table of
+// all walks.
+@Field List<Map> reportBlocks = []
+@Field String reportSection = 'walk'
+
+void printHeading(String consoleText, String markdownText) {
+    println ''
+    println "=== ${consoleText} ==="
+    reportBlocks << [section: reportSection, type: 'heading', text: markdownText]
+}
+
 void printLine(String labelKey, String text) {
+    int width = LABEL_KEYS.collect { tr("label.${it}").length() }.max()
+    println String.format(Locale.ROOT, "%-${width}s : %s", tr("label.${labelKey}"), text)
+    reportBlocks << [section: reportSection, type: 'field', label: tr("label.${labelKey}"), text: text]
+}
+
+void printText(String text) {
+    println text
+    reportBlocks << [section: reportSection, type: 'text', text: text]
+}
+
+// A labelled paragraph (a note) or list (highlights), with marks such as "(draft, unchecked)".
+void printLabelled(String labelKey, String marks, List<String> lines, boolean asList) {
+    if (asList) {
+        printLineConsoleOnly(labelKey, marks.trim())
+        lines.each { println "  ${it}" }
+    } else {
+        printLineConsoleOnly(labelKey, marks + lines.join(' '))
+    }
+    reportBlocks << [section: reportSection, type: asList ? 'labelledList' : 'labelledText', label: tr("label.${labelKey}"), marks: marks.trim(), lines: lines]
+}
+
+void printLineConsoleOnly(String labelKey, String text) {
     int width = LABEL_KEYS.collect { tr("label.${it}").length() }.max()
     println String.format(Locale.ROOT, "%-${width}s : %s", tr("label.${labelKey}"), text)
 }
@@ -850,6 +899,81 @@ void printTable(List<String> headers, List<List<String>> rows, String indent = '
     }
     println format(headers)
     rows.each { println format(it) }
+    reportBlocks << [section: reportSection, type: 'table', headers: headers, rows: rows]
+}
+
+// The combined report as Markdown: a title, the table of all walks, then each walk (its notes
+// and highlights first, then its figures and tables) and finally the personal effort curve.
+// Consecutive fields become one bullet list. The output passes markdownlint, apart from long
+// lines (MD013).
+String markdownReport(int walkCount) {
+    List<String> out = ["# ${tr('report.title')}".toString(), '',
+        tr('report.intro', num(walkCount, 0), longDate(LocalDate.now())), '']
+    Closure<String> escape = { String text -> text.replace('|', '\\|') }
+    Closure<String> table = { List<String> headers, List<List<String>> rows ->
+        List<Integer> widths = (0..<headers.size()).collect { c ->
+            Math.max(3, ([headers[c]] + rows.collect { it[c] }).collect { escape(it).length() }.max() as int)
+        }
+        Closure<String> row = { List<String> cells ->
+            '| ' + (0..<cells.size()).collect { c -> c == 0 ? escape(cells[c]).padRight(widths[c]) : escape(cells[c]).padLeft(widths[c]) }.join(' | ') + ' |'
+        }
+        String rule = '| ' + (0..<headers.size()).collect { c -> c == 0 ? '-' * widths[c] : '-' * (widths[c] - 1) + ':' }.join(' | ') + ' |'
+        ([row(headers), rule] + rows.collect { row(it) }).join('\n')
+    }
+    List<Map> ordered = []
+    ['all', 'walk', 'curve'].each { section ->
+        List<Map> blocks = reportBlocks.findAll { it.section == section }
+        if (section == 'walk') {
+            // Within each walk, notes and highlights come straight after the heading.
+            List<List<Map>> walks = []
+            blocks.each { b ->
+                if (b.type == 'heading') {
+                    walks << []
+                }
+                walks[-1] << b
+            }
+            walks.each { w ->
+                ordered.addAll(w.findAll { it.type == 'heading' })
+                ordered.addAll(w.findAll { it.type in ['labelledText', 'labelledList'] })
+                ordered.addAll(w.findAll { !(it.type in ['heading', 'labelledText', 'labelledList']) })
+            }
+        } else {
+            ordered.addAll(blocks)
+        }
+    }
+    for (int i = 0; i < ordered.size(); i++) {
+        Map b = ordered[i]
+        switch (b.type) {
+            case 'heading':
+                out << "## ${b.text}".toString()
+                break
+            case 'field':
+                out << "- **${b.label}:** ${b.text}".toString()
+                if (i + 1 < ordered.size() && ordered[i + 1].type == 'field') {
+                    continue
+                }
+                break
+            case 'text':
+                out << (b.text as String)
+                break
+            case 'labelledText':
+                out << "**${b.label}**${b.marks ? ' ' + b.marks : ''}: ${(b.lines as List<String>).join(' ')}".toString()
+                break
+            case 'labelledList':
+                out << "**${b.label}**${b.marks ? ' ' + b.marks : ''}:".toString()
+                out << ''
+                (b.lines as List<String>).each { out << "- ${it}".toString() }
+                break
+            case 'table':
+                out << table(b.headers as List<String>, b.rows as List<List<String>>)
+                break
+        }
+        out << ''
+    }
+    while (out && out[-1] == '') {
+        out.remove(out.size() - 1)
+    }
+    out.join('\n') + '\n'
 }
 
 double haversine(double lat1, double lon1, double lat2, double lon2) {
@@ -1810,6 +1934,30 @@ void writeDraftHighlights(java.io.File fitFile, Map highlights, boolean redraft)
     }
 }
 
+// Highlights: the checked (or draft) file in the report language, after drafting one from
+// OpenStreetMap and the recorded data where none exists yet.
+void showHighlights(java.io.File file, List<Map> records, java.io.File mapsDir, String baseName, Options options) {
+    if (!options.noHighlights) {
+        List<Map> positioned = records.findAll { it.lat != null }
+        Map osm = null
+        try {
+            osm = fetchOsmFeatures(positioned, new java.io.File(mapsDir, "${baseName}.osm-highlights.json"))
+        } catch (Exception ex) {
+            System.err.println(tr('hl.failed', ex.message))
+        }
+        Map highlights = routeHighlights(records, osm)
+        if (osm != null) {
+            writeDraftHighlights(file, highlights, options.redraft)
+        } else if (!readWalkText(file, 'highlights', false)) {
+            printLabelled('highlights', '(' + tr('draft') + ')', highlightLines(highlights, lang), true)
+        }
+    }
+    Map highlightText = readWalkText(file, 'highlights', false)
+    if (highlightText) {
+        printLabelled('highlights', walkTextMarks(highlightText), highlightText.lines as List<String>, true)
+    }
+}
+
 Map analyse(java.io.File file, Options options) {
     Map loaded = loadFit(file, !options.fitAltitude)
     List<Map> records = loaded.records as List<Map>
@@ -1819,35 +1967,40 @@ Map analyse(java.io.File file, Options options) {
     String baseName = file.name.replaceFirst(/(?i)\.fit$/, '')
     Map summary = [name: file.name, date: Instant.ofEpochSecond(records[0].epochSecond as long).atZone(LOCAL_ZONE).toLocalDate()]
 
-    println ''
-    println "=== ${file.name} ==="
-    Map source = loaded.altitudeSource as Map
-    printLine('altitudeFrom', source.matched != null ? tr('altitude.gpx', num(source.matched as double, 0), num(source.total as double, 0)) : tr('altitude.fit'))
     long start = records[0].epochSecond as long
     long finish = records[-1].epochSecond as long
-    printLine('walk', tr('walk', longDate(summary.date as LocalDate), clock(start), clock(finish)))
-    Map notes = readWalkText(file, 'notes', true)
-    if (notes) {
-        printLine('howItFelt', walkTextMarks(notes) + notes.lines[0])
-    }
 
-    Map correction = null
+    // Correct the start and mark moving first: the highlights, shown near the top, need both.
+    String correctionText = null
     if (!options.noTerrainStart) {
         try {
-            correction = estimateStartError(records, new TerrainModel(new java.io.File(mapsDir, 'mdt05')))
+            Map correction = estimateStartError(records, new TerrainModel(new java.io.File(mapsDir, 'mdt05')))
             if (correction) {
                 correctStart(records, correction)
-                printLine('startCorrected', tr('start.corrected', signed(correction.startError as double, 0) + NBSP + 'm',
-                    unit(correction.settleM as double, 0, 'm')))
+                correctionText = tr('start.corrected', signed(correction.startError as double, 0) + NBSP + 'm', unit(correction.settleM as double, 0, 'm'))
             } else {
-                printLine('startCorrected', tr('start.notCorrected'))
+                correctionText = tr('start.notCorrected')
             }
         } catch (Exception ex) {
             System.err.println(tr('start.unavailable', ex.message))
         }
     }
-
     markMoving(records)
+
+    printHeading(file.name, tr('walk', longDate(summary.date as LocalDate), clock(start), clock(finish)))
+    printLine('file', file.name)
+    Map source = loaded.altitudeSource as Map
+    printLine('altitudeFrom', source.matched != null ? tr('altitude.gpx', num(source.matched as double, 0), num(source.total as double, 0)) : tr('altitude.fit'))
+    printLine('walk', tr('walk', longDate(summary.date as LocalDate), clock(start), clock(finish)))
+    Map notes = readWalkText(file, 'notes', true)
+    if (notes) {
+        printLabelled('howItFelt', walkTextMarks(notes), notes.lines as List<String>, false)
+    }
+    showHighlights(file, records, mapsDir, baseName, options)
+    if (correctionText) {
+        printLine('startCorrected', correctionText)
+    }
+
     double movingHours = (records.findAll { it.moving }.sum { it.dtS as double } ?: 0.0) / 3600.0
     double distanceKm = (session.totalDistanceM ?: records[-1].distance) / 1000.0
     double elapsedHours = (finish - start) / 3600.0
@@ -1874,7 +2027,7 @@ Map analyse(java.io.File file, Options options) {
     int steepFrom = gradientBandIndex(15.0)
     double steepUp = bands.drop(steepFrom).sum { it[0] } as double
     double steepDown = bands.drop(steepFrom).sum { it[1] } as double
-    println tr('steep', pct(15.0, 0), unit(steepUp, 0, 'm'), unit(steepDown, 0, 'm'))
+    printText(tr('steep', pct(15.0, 0), unit(steepUp, 0, 'm'), unit(steepDown, 0, 'm')))
     summary.ascent = ascent
     summary.descent = descent
     summary.steepUp = steepUp
@@ -1916,7 +2069,7 @@ Map analyse(java.io.File file, Options options) {
             printLine('zones', tr('zones', parts.join(' | ')))
         }
         Map byGradient = heartRateByGradient(records, restingHr)
-        println tr('byGradient.title', unit(HR_LAG_S, 0, 's'), bandLabel(0), num(byGradient.flatBeatsPerKm as double, 0))
+        printText(tr('byGradient.title', unit(HR_LAG_S, 0, 's'), bandLabel(0), num(byGradient.flatBeatsPerKm as double, 0)))
         List<Double> edges = [0.0] + GRADIENT_BAND_EDGES_PCT + [40.0]
         printTable([tr('bands.gradient'), tr('byGradient.km'), tr('byGradient.min'), tr('byGradient.meanHr'), tr('byGradient.beatsPerKm'),
                     tr('byGradient.relative'), tr('byGradient.minetti')],
@@ -2002,29 +2155,6 @@ Map analyse(java.io.File file, Options options) {
         }
     }
 
-    // Highlights: the checked (or draft) file in the report language, after drafting one from
-    // OpenStreetMap and the recorded data where none exists yet.
-    if (!options.noHighlights) {
-        List<Map> positioned = records.findAll { it.lat != null }
-        Map osm = null
-        try {
-            osm = fetchOsmFeatures(positioned, new java.io.File(mapsDir, "${baseName}.osm-highlights.json"))
-        } catch (Exception ex) {
-            System.err.println(tr('hl.failed', ex.message))
-        }
-        Map highlights = routeHighlights(records, osm)
-        if (osm != null) {
-            writeDraftHighlights(file, highlights, options.redraft)
-        } else if (!readWalkText(file, 'highlights', false)) {
-            printLine('highlights', '(' + tr('draft') + ')')
-            highlightLines(highlights, lang).each { println "  ${it}" }
-        }
-    }
-    Map highlightText = readWalkText(file, 'highlights', false)
-    if (highlightText) {
-        printLine('highlights', walkTextMarks(highlightText).trim())
-        (highlightText.lines as List<String>).each { println "  ${it}" }
-    }
     summary
 }
 
@@ -2140,24 +2270,24 @@ Map pooledEffortCurve(List<Map> summaries) {
 if (summaries.size() > 1) {
     Map curve = pooledEffortCurve(summaries)
     if (curve.anchors) {
-        println ''
-        println "=== ${tr('curve.title', summaries.count { it.hrByGradient })} ==="
-        println tr('curve.intro')
+        reportSection = 'curve'
+        printHeading(tr('curve.title', summaries.count { it.hrByGradient }), tr('curve.title', summaries.count { it.hrByGradient }))
+        printText(tr('curve.intro'))
         printTable([tr('bands.gradient'), tr('curve.mid'), 'km', tr('curve.factor'), tr('byGradient.minetti')],
             (curve.anchors as List<Map>).collect { a ->
                 [bandLabel(a.bandIndex as int, a.climb as boolean), pct(a.gradePct as double, 1), num(a.km as double, 1),
                  num(a.factor as double, 2), num(minettiWalkingRelative((a.gradePct as double) / 100.0), 2)]
             })
         // For pasting into ElevationProfiler's code, so always in code notation.
-        println tr('curve.anchors') + (curve.anchors as List<Map>).collect { String.format(Locale.ROOT, '[%.1f, %.2f]', it.gradePct as double, it.factor as double) }.join(', ')
+        printText(tr('curve.anchors') + (curve.anchors as List<Map>).collect { String.format(Locale.ROOT, '[%.1f, %.2f]', it.gradePct as double, it.factor as double) }.join(', '))
         if (curve.heat) {
             Map h = curve.heat as Map
-            println tr('curve.heat', pct(h.pctPerDegAt20 as double, 1), num(h.walks as double, 0), range(h.minTemp as double, h.maxTemp as double, 0, '°C'))
+            printText(tr('curve.heat', pct(h.pctPerDegAt20 as double, 1), num(h.walks as double, 0), range(h.minTemp as double, h.maxTemp as double, 0, '°C')))
         }
     }
 
-    println ''
-    println "=== ${tr('all.title')} ==="
+    reportSection = 'all'
+    printHeading(tr('all.title'), tr('all.title'))
     Closure<String> orDash = { Object v, int decimals -> v == null ? '–' : num(v as double, decimals) }
     printTable([tr('all.date'), 'km', tr('all.up') + ' (m)', tr('all.down') + ' (m)', tr('all.steep') + ' (m)', tr('all.moving'), tr('all.hr'),
                 tr('all.netBeats'), tr('all.beatsPerKm'), 'kcal', tr('all.load'), tr('all.effort'), tr('all.air') + ' (°C)', tr('all.sunUtci') + ' (°C)'],
@@ -2167,4 +2297,12 @@ if (summaries.size() > 1) {
              orDash(s.netBeats, 0), s.netBeats != null ? num((s.netBeats as double) / (s.km as double), 0) : '–', orDash(s.kcal, 0),
              orDash(s.trainingLoad, 0), orDash(s.rpe, 0), orDash(s.meanTemp, 0), orDash(s.meanSunUtci, 0)]
         }, '')
+}
+
+if (summaries && !options.noReport) {
+    java.io.File first = options.files.find { it.exists() }.absoluteFile
+    java.io.File target = options.reportFile ?: new java.io.File(first.parentFile, lang == 'en' ? 'walk-report.md' : "walk-report.${lang}.md")
+    target.setText(markdownReport(summaries.size()), 'UTF-8')
+    println ''
+    println tr('report.written', target.path)
 }
