@@ -250,8 +250,12 @@ on an Apple Watch and exported from HealthFit as FIT plus GPX with the
 same name:
 
 ```sh
-groovy WalkAnalyser.groovy [-t <m>] [--no-terrain-start] [--no-weather] [--fit-altitude] [--maps <dir>] <walk.fit> [...]
+groovy WalkAnalyser.groovy [-l en|fi] [-t <m>] [--no-terrain-start] [--no-weather] [--no-highlights] [--redraft] [--fit-altitude] [--maps <dir>] <walk.fit> [...]
 ```
+
+The report is in English by default and in Finnish with `-l fi`
+(`--language`), with numbers, units, dates and times written to each
+language's conventions (see `docs/style-guide.md`).
 
 The FIT file supplies the watch's distance, heart rate, cadence and
 session totals; altitudes come from the GPX export, matched by timestamp,
@@ -302,12 +306,42 @@ walk it reports:
   more recent archive data can still be revised.
 
 A note on how the walk felt can sit next to the FIT file as
-`<walk>.notes.txt` (same name, whitespace normalised as for the GPX): its
-text is shown under the walk's header. Lines starting with `#` are
-comments, and a comment containing "draft" marks the note as an unchecked
-best guess, for example one drafted from the recorded figures, until you
-edit it and delete that line. Notes are personal data and stay with the
-walks under the gitignored `gpx/`.
+`<walk>.notes.txt` (same name, whitespace normalised as for the GPX), with
+a Finnish version as `<walk>.notes.fi.txt`: its text is shown under the
+walk's header, in the report language if there is one and otherwise in
+the other language, marked as such. Lines starting with `#` are comments,
+and a comment containing "draft" (or "luonnos") marks the note as an
+unchecked best guess, for example one drafted from the recorded figures,
+until you edit it and delete that line. Notes are personal data and stay
+with the walks under the gitignored `gpx/`.
+
+Route highlights work the same way, as `<walk>.highlights.txt` and
+`<walk>.highlights.fi.txt`, one highlight per line. Where neither exists,
+the analyser drafts both from:
+
+- **OpenStreetMap features passed**, from one Overpass API query for the
+  walk's bounding box, cached in `maps/` (delete the file to refresh it):
+  castles, lighthouses, monasteries, peaks, waterfalls, viewpoints,
+  beaches, coves, towers, ruins, headlands, archaeological sites, town
+  gates, churches and chapels, springs, monuments, caves, museums and
+  attractions. Each kind has its own distance from the track within which
+  it counts as passed (50 m for a church, 150 m for a lighthouse), and the
+  ten best are listed by kind, with a bonus for a Wikipedia article.
+  Catalan and Spanish names (Monestir, Ermita) override vaguer tags, and
+  numbered inventory entries such as dry-stone huts are left out.
+- **Stops** of at least 10 minutes away from the start and finish (pauses
+  less than 100 m apart counting as one), each paired with the best
+  feature within 150 m, since a long stop near a viewpoint or beach
+  suggests a real highlight.
+- **The route through settlements**: the towns or villages nearest the
+  start and finish, and any passed through.
+- **The high point** (named when a peak is there) and the **longest climb
+  and descent**, between turning points where the altitude turns back by
+  at least 20 m.
+
+Drafts are never written over once checked (draft line removed);
+`--redraft` rewrites the ones still marked as drafts. `--no-highlights`
+skips the OpenStreetMap query and drafting, and only shows existing files.
 
 With several files, a final table compares the walks side by side. Its
 ascent, descent and steep figures reproduce the separate Python analyser

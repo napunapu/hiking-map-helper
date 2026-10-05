@@ -52,7 +52,16 @@ class Options {
     @Option(names = ['--fit-altitude'], description = 'Use the FIT file\'s own altitudes (0.2 m steps) even when a GPX export sits next to it')
     boolean fitAltitude = false
 
-    @Option(names = ['--maps'], description = 'Cache folder for terrain tiles and weather (default: the nearest existing maps/ folder next to the input file or one level up, otherwise maps/ next to the input file)')
+    @Option(names = ['-l', '--language'], description = 'Report language: en (English, the default) or fi (Finnish); notes and highlights are read from <walk>.notes.fi.txt and <walk>.highlights.fi.txt for Finnish')
+    String language = 'en'
+
+    @Option(names = ['--no-highlights'], description = 'Don\'t look up route highlights in OpenStreetMap (via the Overpass API) or draft highlight files')
+    boolean noHighlights = false
+
+    @Option(names = ['--redraft'], description = 'Rewrite highlight files that are still drafts (their draft line not yet removed); checked files are never overwritten')
+    boolean redraft = false
+
+    @Option(names = ['--maps'], description = 'Cache folder for terrain tiles, weather and OpenStreetMap features (default: the nearest existing maps/ folder next to the input file or one level up, otherwise maps/ next to the input file)')
     java.io.File mapsDir
 }
 
@@ -515,6 +524,334 @@ class ThermalComfort {
 @Field final int HR_LAG_S = 30
 @Field final ZoneId LOCAL_ZONE = ZoneId.of('Europe/Madrid')
 
+// ----- localisation -----
+
+// All report text in English (British, following the European Commission's DGT English Style
+// Guide) and Finnish; see docs/style-guide.md for the number, unit, date and time conventions.
+// Templates take %s placeholders filled with already formatted values (see the formatting
+// helpers below), so a translation can reorder nothing but its own words.
+@Field final List<String> LANGUAGES = ['en', 'fi']
+@Field String lang = 'en'
+@Field final Map<String, Map<String, String>> MESSAGES = [
+    en: [
+        'label.altitudeFrom': 'Altitude from',
+        'label.walk': 'Walk',
+        'label.howItFelt': 'How it felt',
+        'label.highlights': 'Highlights',
+        'label.startCorrected': 'Start corrected',
+        'label.distance': 'Distance',
+        'label.time': 'Time',
+        'label.ascentDescent': 'Ascent/descent',
+        'label.altitudeRange': 'Altitude range',
+        'label.heartRate': 'Heart rate',
+        'label.netBeats': 'Net heartbeats',
+        'label.zones': 'Heart-rate zones',
+        'label.steps': 'Steps',
+        'label.energy': 'Energy/effort',
+        'label.watchWeather': 'Watch weather',
+        'label.weather': 'Weather',
+        'label.sunshine': 'Sunshine',
+        'label.feltHeat': 'Felt heat (UTCI)',
+        'draft': 'draft, unchecked',
+        'fallback': 'in Finnish',
+        'altitude.fit': 'FIT (0.2 m steps)',
+        'altitude.gpx': 'GPX export (%s of %s records), FIT distance',
+        'walk': '%s, %s–%s local time',
+        'start.corrected': 'watch read %s against terrain, settling over %s',
+        'start.notCorrected': 'checked against terrain: no settling error found, not corrected',
+        'start.unavailable': 'IGN MDT05 terrain model unavailable (%s); start not corrected.',
+        'distance': '%s (watch)',
+        'time': '%s elapsed, %s moving (%s), %s stopped',
+        'ascent': '%s / %s at %s threshold%s',
+        'ascent.watchTotal': ' (watch\'s own total %s)',
+        'bands.gradient': 'Gradient',
+        'bands.ascent': 'Ascent',
+        'bands.descent': 'Descent',
+        'steep': 'Steeper than %s: %s up, %s down',
+        'heartRate': '%s average / %s maximum / %s minimum (watch); %s average while moving, %s of heart-rate reserve (resting %s, maximum %s)',
+        'netBeats': '%s above resting while moving (%s per km, %s per moving minute)',
+        'zones': '%s (watch)',
+        'byGradient.title': 'Heart rate by gradient while moving (heart rate %s later; net beats per km relative to %s, flat = %s beats/km):',
+        'byGradient.km': 'km',
+        'byGradient.min': 'min',
+        'byGradient.meanHr': 'Mean HR',
+        'byGradient.beatsPerKm': 'Beats/km',
+        'byGradient.relative': 'Relative',
+        'byGradient.minetti': 'Minetti 2002',
+        'steps': '%s (%s steps/min while moving, %s average step)',
+        'energy.mets': '%s METs average',
+        'energy.load': 'training load %s',
+        'energy.effort': 'effort %s/10%s',
+        'energy.estimated': ' (estimated by the watch)',
+        'watchWeather': '%s%s (one value per walk: the weather at the start, not an average)',
+        'watchWeather.humidity': ', humidity %s',
+        'weather': 'Open-Meteo, every 15 min: %s, mean %s; hottest %s at %s; direct sun up to %s',
+        'sunshine': '%s of the walk (direct sun ≥ %s)',
+        'feltHeat': 'while sunny, shade %s and full sun %s (means); peak in full sun %s at %s (%s)',
+        'weather.failed': 'Open-Meteo request failed (%s); no weather along the route.',
+        'heat.no heat stress': 'no heat stress',
+        'heat.moderate heat stress': 'moderate heat stress',
+        'heat.strong heat stress': 'strong heat stress',
+        'heat.very strong heat stress': 'very strong heat stress',
+        'heat.extreme heat stress': 'extreme heat stress',
+        'input.notFound': 'Input file not found: %s',
+        'curve.title': 'Personal effort curve from %s walks',
+        'curve.intro': 'Net heartbeats per km relative to near-flat walking, pooled by distance (bands under 1 km left out):',
+        'curve.mid': 'Mid',
+        'curve.factor': 'Factor',
+        'curve.anchors': 'As anchors [grade %, factor]: ',
+        'curve.heat': 'Heat: net heartbeats per km of that cost rise %s per °C of mean air temperature (relative to 20 °C; %s walks, %s)',
+        'all.title': 'All walks',
+        'all.date': 'Date',
+        'all.up': 'Up',
+        'all.down': 'Down',
+        'all.steep': 'Steep up/down',
+        'all.moving': 'Moving',
+        'all.hr': 'Mean HR',
+        'all.netBeats': 'Net beats',
+        'all.beatsPerKm': 'Beats/km',
+        'all.load': 'Load',
+        'all.effort': 'Effort',
+        'all.air': 'Air',
+        'all.sunUtci': 'Sun UTCI',
+        'hl.draftHeader': '# Draft: best guess from OpenStreetMap and the recorded data – check, edit and delete this line.',
+        'hl.route': 'Route: %s',
+        'hl.item': 'km %s (%s): %s',
+        'hl.stop': '%s-minute stop',
+        'hl.highPoint': 'High point: %s at km %s%s',
+        'hl.climb': 'Longest climb: %s over %s (km %s, average %s)',
+        'hl.descent': 'Longest descent: %s over %s (km %s, average %s)',
+        'hl.failed': 'OpenStreetMap request failed (%s); highlights from the recorded data only, no draft written.',
+        'hl.written': 'Draft highlights written to %s',
+        'kind.castle': 'castle',
+        'kind.lighthouse': 'lighthouse',
+        'kind.monastery': 'monastery',
+        'kind.peak': 'peak',
+        'kind.viewpoint': 'viewpoint',
+        'kind.beach': 'beach',
+        'kind.cove': 'cove',
+        'kind.headland': 'headland',
+        'kind.tower': 'tower',
+        'kind.ruins': 'ruins',
+        'kind.archaeological': 'archaeological site',
+        'kind.gate': 'town gate',
+        'kind.church': 'church',
+        'kind.chapel': 'chapel',
+        'kind.monument': 'monument',
+        'kind.spring': 'spring',
+        'kind.waterfall': 'waterfall',
+        'kind.cave': 'cave',
+        'kind.museum': 'museum',
+        'kind.attraction': 'attraction'
+    ],
+    fi: [
+        'label.altitudeFrom': 'Korkeuslähde',
+        'label.walk': 'Kävely',
+        'label.howItFelt': 'Tuntuma',
+        'label.highlights': 'Kohokohdat',
+        'label.startCorrected': 'Alun korjaus',
+        'label.distance': 'Matka',
+        'label.time': 'Aika',
+        'label.ascentDescent': 'Nousu/lasku',
+        'label.altitudeRange': 'Korkeusvaihtelu',
+        'label.heartRate': 'Syke',
+        'label.netBeats': 'Nettolyönnit',
+        'label.zones': 'Sykealueet',
+        'label.steps': 'Askeleet',
+        'label.energy': 'Energia/rasitus',
+        'label.watchWeather': 'Kellon sää',
+        'label.weather': 'Sää',
+        'label.sunshine': 'Auringonpaiste',
+        'label.feltHeat': 'Tuntuva lämpö (UTCI)',
+        'draft': 'luonnos, tarkistamatta',
+        'fallback': 'englanniksi',
+        'altitude.fit': 'FIT (0,2 m:n portain)',
+        'altitude.gpx': 'GPX-vienti (%s/%s tietuetta), matka FIT-tiedostosta',
+        'walk': '%s klo %s–%s paikallista aikaa',
+        'start.corrected': 'kello näytti %s maastomalliin verrattuna, tasaantui %s:n matkalla',
+        'start.notCorrected': 'tarkistettu maastomallista: tasaantumisvirhettä ei löytynyt, ei korjattu',
+        'start.unavailable': 'IGN MDT05 -maastomalli ei ole käytettävissä (%s); alkua ei korjattu.',
+        'distance': '%s (kello)',
+        'time': '%s yhteensä, %s liikkeellä (%s), %s pysähdyksissä',
+        'ascent': '%s / %s, kynnys %s%s',
+        'ascent.watchTotal': ' (kellon oma summa %s)',
+        'bands.gradient': 'Kaltevuus',
+        'bands.ascent': 'Nousu',
+        'bands.descent': 'Lasku',
+        'steep': 'Jyrkempää kuin %s: %s ylös, %s alas',
+        'heartRate': 'keskimäärin %s / enintään %s / vähintään %s (kello); liikkeellä keskimäärin %s, %s sykereservistä (leposyke %s, maksimisyke %s)',
+        'netBeats': '%s leposykkeen yli liikkeellä (%s/km, %s liikeminuuttia kohden)',
+        'zones': '%s (kello)',
+        'byGradient.title': 'Syke kaltevuuden mukaan liikkeellä (syke %s myöhemmin; nettolyönnit kilometriä kohden suhteessa kaltevuuteen %s, tasainen = %s lyöntiä/km):',
+        'byGradient.km': 'km',
+        'byGradient.min': 'min',
+        'byGradient.meanHr': 'Keskisyke',
+        'byGradient.beatsPerKm': 'Lyöntiä/km',
+        'byGradient.relative': 'Suhteellinen',
+        'byGradient.minetti': 'Minetti 2002',
+        'steps': '%s (liikkeellä %s askelta/min, keskimääräinen askel %s)',
+        'energy.mets': 'keskimäärin %s MET',
+        'energy.load': 'harjoituskuorma %s',
+        'energy.effort': 'rasitus %s/10%s',
+        'energy.estimated': ' (kellon arvio)',
+        'watchWeather': '%s%s (yksi arvo kävelyä kohden: sää alussa, ei keskiarvo)',
+        'watchWeather.humidity': ', kosteus %s',
+        'weather': 'Open-Meteo, 15 minuutin välein: %s, keskimäärin %s; lämpimin %s klo %s; suoraa auringonsäteilyä enintään %s',
+        'sunshine': '%s kävelystä (suora säteily ≥ %s)',
+        'feltHeat': 'auringon paistaessa varjossa %s ja täydessä auringossa %s (keskiarvot); huippu täydessä auringossa %s klo %s (%s)',
+        'weather.failed': 'Open-Meteo-pyyntö epäonnistui (%s); reitin säätietoja ei ole.',
+        'heat.no heat stress': 'ei lämpökuormitusta',
+        'heat.moderate heat stress': 'kohtalainen lämpökuormitus',
+        'heat.strong heat stress': 'voimakas lämpökuormitus',
+        'heat.very strong heat stress': 'hyvin voimakas lämpökuormitus',
+        'heat.extreme heat stress': 'äärimmäinen lämpökuormitus',
+        'input.notFound': 'Syötetiedostoa ei löydy: %s',
+        'curve.title': 'Henkilökohtainen rasituskäyrä %s kävelystä',
+        'curve.intro': 'Nettolyönnit kilometriä kohden suhteessa lähes tasaiseen kävelyyn, matkalla painotettuna (alle 1 km:n kaltevuusluokat jätetty pois):',
+        'curve.mid': 'Keskikohta',
+        'curve.factor': 'Kerroin',
+        'curve.anchors': 'Ankkureina [kaltevuus %, kerroin]: ',
+        'curve.heat': 'Lämpö: nettolyönnit tämän kustannuksen kilometriä kohden kasvavat %s ilman keskilämpötilan astetta kohden (suhteessa 20 °C:seen; %s kävelyä, %s)',
+        'all.title': 'Kaikki kävelyt',
+        'all.date': 'Päivä',
+        'all.up': 'Ylös',
+        'all.down': 'Alas',
+        'all.steep': 'Jyrkkä ylös/alas',
+        'all.moving': 'Liikkeellä',
+        'all.hr': 'Keskisyke',
+        'all.netBeats': 'Nettolyönnit',
+        'all.beatsPerKm': 'Lyöntiä/km',
+        'all.load': 'Kuorma',
+        'all.effort': 'Rasitus',
+        'all.air': 'Ilma',
+        'all.sunUtci': 'UTCI auringossa',
+        'hl.draftHeader': '# Luonnos (draft): paras arvaus OpenStreetMapin ja tallennettujen tietojen perusteella – tarkista, muokkaa ja poista tämä rivi.',
+        'hl.route': 'Reitti: %s',
+        'hl.item': 'km %s (klo %s): %s',
+        'hl.stop': '%s minuutin tauko',
+        'hl.highPoint': 'Korkein kohta: %s, km %s%s',
+        'hl.climb': 'Pisin nousu: %s %s:n matkalla (km %s, keskimäärin %s)',
+        'hl.descent': 'Pisin lasku: %s %s:n matkalla (km %s, keskimäärin %s)',
+        'hl.failed': 'OpenStreetMap-pyyntö epäonnistui (%s); kohokohdat vain tallennetuista tiedoista, luonnosta ei kirjoitettu.',
+        'hl.written': 'Kohokohtien luonnos kirjoitettu: %s',
+        'kind.castle': 'linna',
+        'kind.lighthouse': 'majakka',
+        'kind.monastery': 'luostari',
+        'kind.peak': 'huippu',
+        'kind.viewpoint': 'näköalapaikka',
+        'kind.beach': 'ranta',
+        'kind.cove': 'poukama',
+        'kind.headland': 'niemi',
+        'kind.tower': 'torni',
+        'kind.ruins': 'rauniot',
+        'kind.archaeological': 'muinaisjäännös',
+        'kind.gate': 'kaupunginportti',
+        'kind.church': 'kirkko',
+        'kind.chapel': 'kappeli',
+        'kind.monument': 'muistomerkki',
+        'kind.spring': 'lähde',
+        'kind.waterfall': 'vesiputous',
+        'kind.cave': 'luola',
+        'kind.museum': 'museo',
+        'kind.attraction': 'nähtävyys'
+    ]
+]
+
+String tr(String key, Object... args) {
+    trIn(lang, key, args)
+}
+
+String trIn(String language, String key, Object... args) {
+    String template = MESSAGES[language][key] ?: MESSAGES.en[key]
+    if (template == null) {
+        throw new IllegalArgumentException("No message for ${key}")
+    }
+    args ? String.format(Locale.ROOT, template, args) : template
+}
+
+// Hard (non-breaking) space, used between a number and its unit and to group thousands.
+@Field final String NBSP = ' '
+
+// A number with the language's decimal marker (point in English, comma in Finnish), thousands
+// grouped with a hard space (15 000) and a true minus sign; NaN prints as an en dash.
+String num(double value, int decimals, String language = lang) {
+    if (Double.isNaN(value) || Double.isInfinite(value)) {
+        return '–'
+    }
+    String plain = String.format(Locale.ROOT, "%.${decimals}f", Math.abs(value))
+    int point = plain.indexOf('.')
+    String whole = point >= 0 ? plain.substring(0, point) : plain
+    String fraction = point >= 0 ? plain.substring(point + 1) : ''
+    StringBuilder grouped = new StringBuilder()
+    for (int i = 0; i < whole.length(); i++) {
+        if (i > 0 && (whole.length() - i) % 3 == 0) {
+            grouped.append(NBSP)
+        }
+        grouped.append(whole.charAt(i))
+    }
+    boolean negative = value < 0 && plain.any { it ==~ /[1-9]/ }
+    (negative ? '−' : '') + grouped + (fraction ? (language == 'fi' ? ',' : '.') + fraction : '')
+}
+
+String signed(double value, int decimals, String language = lang) {
+    String text = num(value, decimals, language)
+    value > 0 && text ==~ /.*[1-9].*/ ? '+' + text : text
+}
+
+String unit(double value, int decimals, String symbol, String language = lang) {
+    num(value, decimals, language) + NBSP + symbol
+}
+
+// Per cent: closed up in English (25%), with a hard space in Finnish (25 %).
+String pct(double value, int decimals, String language = lang) {
+    num(value, decimals, language) + (language == 'fi' ? NBSP : '') + '%'
+}
+
+// A range with a closed-up en dash and the unit once: 10–70 °C.
+String range(double from, double to, int decimals, String symbol, String language = lang) {
+    String suffix = symbol == '%' ? (language == 'fi' ? NBSP + '%' : '%') : NBSP + symbol
+    num(from, decimals, language) + '–' + num(to, decimals, language) + suffix
+}
+
+// Time of day on the 24-hour clock: 09:30 in English, 9.30 in Finnish.
+String clock(long epochSecond, String language = lang) {
+    Instant.ofEpochSecond(epochSecond).atZone(LOCAL_ZONE).format(DateTimeFormatter.ofPattern(language == 'fi' ? 'H.mm' : 'HH:mm'))
+}
+
+// Dates in full in running text (6 September 2026) and in the short form in tables (6.9.2026,
+// no leading zeros) - the same short form in both languages.
+String longDate(LocalDate date, String language = lang) {
+    language == 'fi' ? date.format(DateTimeFormatter.ofPattern('d.M.yyyy')) : date.format(DateTimeFormatter.ofPattern('d MMMM yyyy', Locale.UK))
+}
+
+String shortDate(LocalDate date) {
+    date.format(DateTimeFormatter.ofPattern('d.M.yyyy'))
+}
+
+String formatHours(double hours) {
+    int totalMinutes = Math.round(hours * 60.0) as int
+    String.format(Locale.ROOT, '%d%sh %02d%smin', totalMinutes.intdiv(60), NBSP, totalMinutes % 60, NBSP)
+}
+
+// The labels in front of each report line, padded to the longest in the current language.
+@Field final List<String> LABEL_KEYS = ['altitudeFrom', 'walk', 'howItFelt', 'highlights', 'startCorrected', 'distance', 'time',
+    'ascentDescent', 'altitudeRange', 'heartRate', 'netBeats', 'zones', 'steps', 'energy', 'watchWeather', 'weather', 'sunshine', 'feltHeat']
+
+void printLine(String labelKey, String text) {
+    int width = LABEL_KEYS.collect { tr("label.${it}").length() }.max()
+    println String.format(Locale.ROOT, "%-${width}s : %s", tr("label.${labelKey}"), text)
+}
+
+// A table with columns sized to fit, the first column left-aligned and the rest right-aligned.
+void printTable(List<String> headers, List<List<String>> rows, String indent = '  ') {
+    List<Integer> widths = (0..<headers.size()).collect { c -> ([headers[c]] + rows.collect { it[c] }).collect { it.length() }.max() }
+    Closure<String> format = { List<String> cells ->
+        indent + (0..<cells.size()).collect { c -> c == 0 ? cells[c].padRight(widths[c]) : cells[c].padLeft(widths[c]) }.join('  ')
+    }
+    println format(headers)
+    rows.each { println format(it) }
+}
+
 double haversine(double lat1, double lon1, double lat2, double lon2) {
     double earthRadiusM = 6371000.0
     double phi1 = Math.toRadians(lat1)
@@ -551,22 +888,36 @@ java.io.File matchingGpx(java.io.File fitFile) {
 }
 
 java.io.File matchingSibling(java.io.File fitFile, String suffix) {
-    Closure<String> stem = { String name -> name.replaceFirst(/(?i)\.(fit|gpx|notes\.txt)$/, '').replaceAll(/[\s\u00a0]+/, ' ') }
+    Closure<String> stem = { String name -> name.replaceFirst(/(?i)\.(fit|gpx|(notes|highlights)(\.[a-z]{2})?\.txt)$/, '').replaceAll(/[\s\u00a0]+/, ' ') }
     String wanted = stem(fitFile.name)
     fitFile.absoluteFile.parentFile.listFiles()?.find { it.name.toLowerCase().endsWith(suffix) && stem(it.name) == wanted }
 }
 
-// A short note on how the walk felt, kept as <walk>.notes.txt next to the FIT file. Lines
-// starting with # are comments; a comment containing "draft" marks the note as an unchecked
-// best guess (e.g. drafted from the recorded data), shown as such.
-Map readWalkNotes(java.io.File fitFile) {
-    java.io.File notesFile = matchingSibling(fitFile, '.notes.txt')
-    if (!notesFile) {
-        return null
+// Notes on how a walk felt and its highlights, kept next to the FIT file as <walk>.notes.txt
+// and <walk>.highlights.txt in English and <walk>.notes.fi.txt and <walk>.highlights.fi.txt in
+// Finnish. Lines starting with # are comments; a comment containing "draft" (or "luonnos")
+// marks the text as an unchecked best guess, shown as such. Returns the text in the report
+// language, or in the other one (marked as a fallback) when there's none in it yet.
+Map readWalkText(java.io.File fitFile, String kind, boolean joinLines) {
+    List<String> order = [lang] + (LANGUAGES - lang)
+    for (String language : order) {
+        java.io.File textFile = matchingSibling(fitFile, language == 'en' ? ".${kind}.txt" : ".${kind}.${language}.txt")
+        Map text = textFile ? readWalkFile(textFile, joinLines) : null
+        if (text) {
+            return text + [fallback: language != lang]
+        }
     }
-    List<String> lines = notesFile.readLines('UTF-8')
-    String text = lines.findAll { !it.trim().startsWith('#') }.join(' ').replaceAll(/\s+/, ' ').trim()
-    text ? [text: text, draft: lines.any { it.trim().startsWith('#') && it.toLowerCase().contains('draft') }] : null
+    null
+}
+
+Map readWalkFile(java.io.File textFile, boolean joinLines) {
+    List<String> all = textFile.readLines('UTF-8')
+    List<String> lines = all.findAll { !it.trim().startsWith('#') && it.trim() }.collect { it.replaceAll(/\s+/, ' ').trim() }
+    if (joinLines && lines) {
+        lines = [lines.join(' ')]
+    }
+    boolean draft = all.any { it.trim().startsWith('#') && it.toLowerCase() =~ /draft|luonnos/ }
+    lines ? [lines: lines, draft: draft] : null
 }
 
 // Loads the FIT file's per-second records, session totals and heart-rate zones. Records keep
@@ -633,7 +984,8 @@ Map loadFit(java.io.File fitFile, boolean useGpxAltitude) {
     } as TimeInZoneMesgListener)
     fitFile.withInputStream { decode.read(it, broadcaster, broadcaster) }
 
-    String altitudeSource = 'FIT (0.2 m steps)'
+    // Null for the FIT file's own altitudes, otherwise how many records got a GPX altitude.
+    Map altitudeSource = [matched: null]
     java.io.File gpxFile = matchingGpx(fitFile)
     if (useGpxAltitude && gpxFile) {
         Map<Long, Double> gpxAltitudes = readGpxAltitudes(gpxFile)
@@ -646,7 +998,7 @@ Map loadFit(java.io.File fitFile, boolean useGpxAltitude) {
             }
         }
         if (matched > 0) {
-            altitudeSource = "GPX export (${matched} of ${records.count { it.altitude != null }} records), FIT distance"
+            altitudeSource = [matched: matched, total: records.count { it.altitude != null }]
         }
     }
     // Records before the first distance reading are at the start.
@@ -1028,13 +1380,434 @@ List<Map> weatherAlongWalk(List<Map> records, java.io.File cacheFile) {
     result
 }
 
-String clock(long epochSecond, ZoneId zone) {
-    Instant.ofEpochSecond(epochSecond).atZone(zone).format(DateTimeFormatter.ofPattern('HH:mm'))
+// ----- route highlights -----
+
+// Kinds of OpenStreetMap feature worth listing as a highlight: a base score for ranking, how
+// far from the track it may lie and still count as passed (a viewpoint or church only when
+// walked right past, a peak or lighthouse also when seen close by), and whether it needs a
+// name (an unnamed viewpoint is only listed when the walk stopped there).
+@Field final Map<String, Map> HIGHLIGHT_KINDS = [
+    castle: [score: 5, maxOffM: 100.0],
+    lighthouse: [score: 5, maxOffM: 150.0],
+    monastery: [score: 5, maxOffM: 100.0],
+    peak: [score: 4, maxOffM: 100.0],
+    waterfall: [score: 3, maxOffM: 100.0],
+    viewpoint: [score: 3, maxOffM: 75.0, unnamed: true],
+    beach: [score: 3, maxOffM: 100.0],
+    cove: [score: 3, maxOffM: 100.0],
+    tower: [score: 3, maxOffM: 100.0],
+    ruins: [score: 3, maxOffM: 75.0],
+    headland: [score: 2, maxOffM: 100.0],
+    archaeological: [score: 2, maxOffM: 75.0],
+    gate: [score: 2, maxOffM: 50.0],
+    church: [score: 2, maxOffM: 50.0],
+    chapel: [score: 2, maxOffM: 50.0],
+    spring: [score: 2, maxOffM: 50.0],
+    monument: [score: 1, maxOffM: 50.0],
+    cave: [score: 1, maxOffM: 50.0],
+    museum: [score: 1, maxOffM: 50.0],
+    attraction: [score: 1, maxOffM: 50.0]
+]
+@Field final int MAX_HIGHLIGHTS = 10
+// Stops at least this long, away from the start and finish, are listed and paired with the
+// best feature within STOP_MATCH_M of where the walk stopped.
+@Field final double STOP_MIN_MINUTES = 10.0
+@Field final double STOP_MATCH_M = 150.0
+// Climbs and descents end where the altitude turns back by at least this much.
+@Field final double LEG_REVERSAL_M = 20.0
+
+// The highlight kind of an OpenStreetMap feature, or null if it isn't one. Catalan and
+// Spanish names say what a building is more reliably than its tags (a monastery's church is
+// often tagged only as a church).
+String highlightKind(Map tags) {
+    String historic = tags.historic
+    String building = tags.building
+    String name = (tags.name ?: '').toString().toLowerCase()
+    if (name ==~ /^(monestir|monasterio|cartoixa|cartuja)\b.*/) {
+        return 'monastery'
+    }
+    if (name ==~ /^(ermita|capella|capilla)\b.*/) {
+        return 'chapel'
+    }
+    if (historic == 'castle' || tags.castle_type) {
+        return 'castle'
+    }
+    if (tags.man_made == 'lighthouse') {
+        return 'lighthouse'
+    }
+    if (historic == 'monastery' || tags.amenity == 'monastery' || building == 'monastery') {
+        return 'monastery'
+    }
+    if (tags.natural == 'peak') {
+        return 'peak'
+    }
+    if (tags.waterway == 'waterfall') {
+        return 'waterfall'
+    }
+    if (tags.tourism == 'viewpoint') {
+        return 'viewpoint'
+    }
+    if (tags.natural == 'beach') {
+        return 'beach'
+    }
+    if (tags.natural == 'bay') {
+        return 'cove'
+    }
+    if (tags.man_made == 'tower' || historic == 'tower') {
+        return 'tower'
+    }
+    if (historic == 'ruins' || building == 'ruins') {
+        return 'ruins'
+    }
+    if (tags.natural == 'cape') {
+        return 'headland'
+    }
+    if (historic == 'city_gate') {
+        return 'gate'
+    }
+    if (building == 'chapel') {
+        return 'chapel'
+    }
+    if (building in ['church', 'cathedral'] || (tags.amenity == 'place_of_worship' && tags.religion == 'christian')) {
+        return 'church'
+    }
+    if (historic == 'archaeological_site') {
+        return 'archaeological'
+    }
+    if (tags.natural == 'spring') {
+        return 'spring'
+    }
+    if (historic in ['monument', 'memorial']) {
+        return 'monument'
+    }
+    if (tags.natural == 'cave_entrance') {
+        return 'cave'
+    }
+    if (tags.tourism == 'museum') {
+        return 'museum'
+    }
+    if (tags.tourism == 'attraction') {
+        return 'attraction'
+    }
+    null
 }
 
-String formatHours(double hours) {
-    int totalMinutes = Math.round(hours * 60.0) as int
-    String.format(Locale.ROOT, '%dh %02dmin', totalMinutes.intdiv(60), totalMinutes % 60)
+// Named features and settlements around the walk from the Overpass API: one query for the
+// walk's bounding box (much lighter for the shared public server than a corridor along the
+// track), filtered by distance from the track afterwards. Settlements get a wider box, since
+// a town's node can sit well away from the path through its outskirts. Cached under maps/;
+// delete the file to refresh it.
+Map fetchOsmFeatures(List<Map> points, java.io.File cacheFile) {
+    double south = points.min { it.lat as double }.lat as double
+    double north = points.max { it.lat as double }.lat as double
+    double west = points.min { it.lon as double }.lon as double
+    double east = points.max { it.lon as double }.lon as double
+    Closure<String> bbox = { double margin ->
+        String.format(Locale.ROOT, '%.4f,%.4f,%.4f,%.4f', south - margin, west - margin, north + margin, east + margin)
+    }
+    String box = bbox(0.005)
+    String query = """[out:json][timeout:90];
+(
+  nwr[tourism~"^(viewpoint|attraction|museum)\$"](${box});
+  nwr[natural~"^(peak|beach|bay|cape|spring|cave_entrance)\$"][name](${box});
+  nwr[man_made~"^(lighthouse|tower)\$"][name](${box});
+  nwr[historic][name](${box});
+  nwr[amenity~"^(place_of_worship|monastery)\$"][name](${box});
+  nwr[waterway=waterfall](${box});
+  node[place~"^(city|town|village|hamlet)\$"][name](${bbox(0.02)});
+);
+out center tags;"""
+    if (cacheFile.exists()) {
+        Map cached = new JsonSlurper().parse(cacheFile) as Map
+        if (cached.query == query) {
+            return cached.response as Map
+        }
+    }
+    String body = 'data=' + URLEncoder.encode(query, 'UTF-8')
+    HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
+    HttpResponse<String> response = null
+    // The shared public server often answers 429 or 504 when busy; a short wait usually helps.
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            Thread.sleep(20000L * attempt)
+        }
+        HttpRequest request = HttpRequest.newBuilder().uri(URI.create('https://overpass-api.de/api/interpreter'))
+            .timeout(Duration.ofSeconds(120)).header('Content-Type', 'application/x-www-form-urlencoded')
+            .POST(HttpRequest.BodyPublishers.ofString(body)).build()
+        response = client.send(request, HttpResponse.BodyHandlers.ofString())
+        if (response.statusCode() == 200) {
+            break
+        }
+    }
+    if (response.statusCode() != 200) {
+        throw new RuntimeException("HTTP ${response.statusCode()}")
+    }
+    Map data = new JsonSlurper().parseText(response.body()) as Map
+    cacheFile.parentFile.mkdirs()
+    cacheFile.text = groovy.json.JsonOutput.toJson([query: query, response: data])
+    data
+}
+
+// Distance in metres on a local flat projection - plenty for distances under a kilometre.
+double nearbyDistanceM(double lat1, double lon1, double lat2, double lon2) {
+    double x = Math.toRadians(lon2 - lon1) * Math.cos(Math.toRadians((lat1 + lat2) / 2.0))
+    double y = Math.toRadians(lat2 - lat1)
+    6371000.0 * Math.sqrt(x * x + y * y)
+}
+
+// The track point nearest to a position, with the distance off the track.
+Map nearestTrackPoint(List<Map> points, double lat, double lon) {
+    Map best = null
+    double bestM = Double.MAX_VALUE
+    for (Map p : points) {
+        double m = nearbyDistanceM(lat, lon, p.lat as double, p.lon as double)
+        if (m < bestM) {
+            bestM = m
+            best = p
+        }
+    }
+    [point: best, offM: bestM]
+}
+
+// Stops of at least STOP_MIN_MINUTES, away from the first and last 200 m of the walk. GPS
+// jitter and walking about at a stop break it into pieces, so pauses less than STOP_MERGE_M
+// apart count as one stop.
+@Field final double STOP_MERGE_M = 100.0
+
+List<Map> findStops(List<Map> records) {
+    List<Map> pauses = []
+    int i = 0
+    while (i < records.size()) {
+        if (records[i].moving) {
+            i++
+            continue
+        }
+        int j = i
+        while (j + 1 < records.size() && !records[j + 1].moving) {
+            j++
+        }
+        Map last = pauses ? pauses[-1] : null
+        if (last && (records[i].distance as double) - (records[last.to as int].distance as double) < STOP_MERGE_M) {
+            last.to = j
+        } else {
+            pauses << [from: i, to: j]
+        }
+        i = j + 1
+    }
+    double endM = records[-1].distance as double
+    List<Map> stops = []
+    pauses.each { p ->
+        Map first = records[p.from as int]
+        double seconds = records.subList(p.from as int, (p.to as int) + 1).findAll { !it.moving }.sum { it.dtS as double } as double
+        double at = first.distance as double
+        Map where = records.subList(p.from as int, (p.to as int) + 1).find { it.lat != null }
+        if (seconds / 60.0 >= STOP_MIN_MINUTES && at > 200.0 && at < endM - 200.0 && where) {
+            stops << [distance: at, epochSecond: first.epochSecond, minutes: seconds / 60.0, lat: where.lat, lon: where.lon]
+        }
+    }
+    stops
+}
+
+// Climbs and descents between turning points where the altitude turns back by at least
+// LEG_REVERSAL_M, as [fromIndex, toIndex] into the profile.
+List<List<Integer>> altitudeLegs(List<Double> altitudes) {
+    List<List<Integer>> legs = []
+    int turn = 0
+    int extreme = 0
+    int lowest = 0
+    int highest = 0
+    int dir = 0
+    for (int i = 1; i < altitudes.size(); i++) {
+        double a = altitudes[i]
+        if (dir == 0) {
+            lowest = a < altitudes[lowest] ? i : lowest
+            highest = a > altitudes[highest] ? i : highest
+            if (a - altitudes[lowest] >= LEG_REVERSAL_M) {
+                dir = 1
+                turn = lowest
+                extreme = i
+            } else if (altitudes[highest] - a >= LEG_REVERSAL_M) {
+                dir = -1
+                turn = highest
+                extreme = i
+            }
+        } else if (dir * (a - altitudes[extreme]) > 0) {
+            extreme = i
+        } else if (dir * (altitudes[extreme] - a) >= LEG_REVERSAL_M) {
+            legs << [turn, extreme]
+            turn = extreme
+            extreme = i
+            dir = -dir
+        }
+    }
+    if (dir != 0) {
+        legs << [turn, extreme]
+    }
+    legs
+}
+
+// The feature's name in the language, if OpenStreetMap has one, otherwise its local name.
+String featureName(Map tags, String language) {
+    (tags["name:${language}"] ?: tags.name) as String
+}
+
+// Highlights of a walk: OpenStreetMap features passed (ranked by kind, with a bonus for a
+// Wikipedia article and for stopping there), long stops, the route through settlements and
+// the high point and longest climb and descent from the recorded altitude. The result is
+// language-neutral; highlightLines words it.
+Map routeHighlights(List<Map> records, Map osm) {
+    // One point per 10 m walked, for the nearest-point searches.
+    List<Map> points = []
+    double next = 0.0
+    records.each { r ->
+        if (r.lat != null && (r.distance as double) >= next) {
+            points << r
+            next = (r.distance as double) + 10.0
+        }
+    }
+    List<Map> features = []
+    List<Map> places = []
+    ((osm?.elements ?: []) as List<Map>).each { e ->
+        Map tags = (e.tags ?: [:]) as Map
+        Double lat = (e.lat ?: (e.center as Map)?.lat) as Double
+        Double lon = (e.lon ?: (e.center as Map)?.lon) as Double
+        if (lat == null || lon == null) {
+            return
+        }
+        Map nearest = nearestTrackPoint(points, lat, lon)
+        if (tags.place in ['city', 'town', 'village', 'hamlet']) {
+            places << [tags: tags, place: tags.place, offM: nearest.offM, point: nearest.point, lat: lat, lon: lon]
+            return
+        }
+        String kind = highlightKind(tags)
+        if (kind == null || (!tags.name && !HIGHLIGHT_KINDS[kind].unnamed)) {
+            return
+        }
+        // Inventory entries (e.g. the dry-stone huts "barraca de pedra seca 19111") aren't sights.
+        if (tags.name ==~ /.*\d{3,}.*/) {
+            return
+        }
+        int score = (HIGHLIGHT_KINDS[kind].score as int) + (tags.wikipedia || tags.wikidata ? 1 : 0)
+        features << [tags: tags, kind: kind, score: score, offM: nearest.offM, point: nearest.point, lat: lat, lon: lon]
+    }
+    // The same place is often mapped twice (a castle's outline and a monument node): keep the
+    // best-scoring of each name, then the nearest.
+    List<Map> passed = features.findAll { (it.offM as double) <= (HIGHLIGHT_KINDS[it.kind].maxOffM as double) }
+        .groupBy { (it.tags.name ?: "${it.kind}@${it.lat},${it.lon}").toString().toLowerCase() }
+        .collect { name, same -> same.min { a, b -> (b.score as int) <=> (a.score as int) ?: (a.offM as double) <=> (b.offM as double) } }
+
+    List<Map> stops = findStops(records)
+    List<Map> items = []
+    Set<Map> used = [] as Set
+    stops.each { stop ->
+        Map best = features.findAll { !used.contains(it) && nearbyDistanceM(stop.lat as double, stop.lon as double, it.lat as double, it.lon as double) <= STOP_MATCH_M }
+            .max { (it.score as int) * 1000 - nearbyDistanceM(stop.lat as double, stop.lon as double, it.lat as double, it.lon as double) }
+        if (best) {
+            used << best
+        }
+        items << [distance: stop.distance, epochSecond: stop.epochSecond, feature: best, stopMinutes: stop.minutes]
+    }
+    Set<String> usedNames = used.collect { (it.tags.name ?: '').toString().toLowerCase() } as Set
+    passed.findAll { !used.contains(it) && it.tags.name && !usedNames.contains(it.tags.name.toString().toLowerCase()) }
+        .sort { a, b -> (b.score as int) <=> (a.score as int) ?: (a.offM as double) <=> (b.offM as double) }
+        .take(Math.max(0, MAX_HIGHLIGHTS - items.size()))
+        .each { items << [distance: it.point.distance, epochSecond: it.point.epochSecond, feature: it] }
+    items.sort { it.distance as double }
+
+    // Route through settlements: the nearest to the start and finish (within 2 km) and any
+    // town or village passed through on the way.
+    Closure<Map> nearestPlace = { Map at ->
+        places.collect { [place: it, m: nearbyDistanceM(at.lat as double, at.lon as double, it.lat as double, it.lon as double)] }
+            .findAll { (it.m as double) <= 2000.0 }.min { it.m as double }?.place
+    }
+    Map startPlace = nearestPlace(points[0])
+    Map finishPlace = nearestPlace(points[-1])
+    List<Map> via = places.findAll { it != startPlace && it != finishPlace && (it.offM as double) <= (it.place == 'hamlet' ? 150.0 : 300.0) }
+        .sort { it.point.distance as double }
+    List<Map> route = []
+    ([startPlace] + via + [finishPlace]).findAll { it != null }.each { p ->
+        if (!route || route[-1].tags.name != p.tags.name) {
+            route << p
+        }
+    }
+
+    // High point, and the longest climb and descent.
+    Map profile = distanceProfile(records.collect { it.distance as double }, records.collect { it.altitude as double })
+    List<Double> pd = profile.distances as List<Double>
+    List<Double> pa = profile.altitudes as List<Double>
+    int top = (0..<pa.size()).max { pa[it] }
+    Map peakFeature = features.findAll { it.kind == 'peak' && nearbyDistanceM(it.lat as double, it.lon as double, it.point.lat as double, it.point.lon as double) <= 150.0 &&
+        Math.abs((it.point.distance as double) - pd[top]) <= 300.0 }.min { it.offM as double }
+    List<List<Integer>> legs = altitudeLegs(pa)
+    Closure<Map> legInfo = { List<Integer> leg ->
+        leg == null ? null : [change: pa[leg[1]] - pa[leg[0]], fromM: pd[leg[0]], toM: pd[leg[1]]]
+    }
+    [items: items, route: route,
+     highPoint: [altitude: pa[top], distance: pd[top], feature: peakFeature],
+     climb: legInfo(legs.findAll { pa[it[1]] > pa[it[0]] }.max { pa[it[1]] - pa[it[0]] }),
+     descent: legInfo(legs.findAll { pa[it[1]] < pa[it[0]] }.max { pa[it[0]] - pa[it[1]] })]
+}
+
+// The highlights worded in a language, one line each.
+List<String> highlightLines(Map highlights, String language) {
+    List<String> lines = []
+    if ((highlights.route as List).size() >= 2) {
+        lines << trIn(language, 'hl.route', (highlights.route as List<Map>).collect { featureName(it.tags as Map, language) }.join(' – '))
+    }
+    (highlights.items as List<Map>).each { item ->
+        List<String> parts = []
+        Map f = item.feature as Map
+        if (f) {
+            String kind = trIn(language, "kind.${f.kind}")
+            String name = featureName(f.tags as Map, language)
+            String elevation = f.kind == 'peak' && (f.tags as Map).ele ? ', ' + unit(((f.tags as Map).ele as String).replace(',', '.') as double, 0, 'm', language) : ''
+            parts << (name ? "${name}, ${kind}${elevation}" : kind.capitalize())
+        }
+        if (item.stopMinutes != null) {
+            String stop = trIn(language, 'hl.stop', num(item.stopMinutes as double, 0, language))
+            parts << (parts ? stop : stop.capitalize())
+        }
+        lines << trIn(language, 'hl.item', num((item.distance as double) / 1000.0, 1, language), clock(item.epochSecond as long, language), parts.join(' – '))
+    }
+    Map high = highlights.highPoint as Map
+    String peakName = high.feature ? " (${featureName((high.feature as Map).tags as Map, language)})" : ''
+    lines << trIn(language, 'hl.highPoint', unit(high.altitude as double, 0, 'm', language), num((high.distance as double) / 1000.0, 1, language), peakName)
+    [climb: 'hl.climb', descent: 'hl.descent'].each { field, key ->
+        Map leg = highlights[field] as Map
+        if (leg) {
+            double km = ((leg.toM as double) - (leg.fromM as double)) / 1000.0
+            lines << trIn(language, key, unit(Math.abs(leg.change as double), 0, 'm', language), unit(km, 1, 'km', language),
+                num((leg.fromM as double) / 1000.0, 1, language) + '–' + num((leg.toM as double) / 1000.0, 1, language),
+                pct(Math.abs(leg.change as double) / (km * 1000.0) * 100.0, 0, language))
+        }
+    }
+    lines
+}
+
+// A gradient band for display: 0–5% (0–5 % in Finnish), with + for climbs and − for descents.
+String bandLabel(int bandIndex, Boolean climb = null) {
+    List<Double> edges = [0.0] + GRADIENT_BAND_EDGES_PCT
+    String sign = climb == null ? '' : (climb ? '+' : '−')
+    String text = bandIndex < edges.size() - 1
+        ? range(edges[bandIndex], edges[bandIndex + 1], 0, '%')
+        : '>' + pct(edges[-1], 0)
+    sign + text
+}
+
+// Writes draft highlight files in every language next to the FIT file, unless one exists
+// already (with --redraft, unless it has been checked, i.e. its draft line removed).
+void writeDraftHighlights(java.io.File fitFile, Map highlights, boolean redraft) {
+    String stem = fitFile.name.replaceFirst(/(?i)\.fit$/, '')
+    LANGUAGES.each { language ->
+        String suffix = language == 'en' ? '.highlights.txt' : ".highlights.${language}.txt"
+        java.io.File existing = matchingSibling(fitFile, suffix)
+        if (existing && !(redraft && readWalkFile(existing, false)?.draft)) {
+            return
+        }
+        java.io.File target = existing ?: new java.io.File(fitFile.absoluteFile.parentFile, stem + suffix)
+        target.setText(([trIn(language, 'hl.draftHeader')] + highlightLines(highlights, language)).join('\n') + '\n', 'UTF-8')
+        println tr('hl.written', target.name)
+    }
 }
 
 Map analyse(java.io.File file, Options options) {
@@ -1048,13 +1821,14 @@ Map analyse(java.io.File file, Options options) {
 
     println ''
     println "=== ${file.name} ==="
-    println "Altitude from  : ${loaded.altitudeSource}"
+    Map source = loaded.altitudeSource as Map
+    printLine('altitudeFrom', source.matched != null ? tr('altitude.gpx', num(source.matched as double, 0), num(source.total as double, 0)) : tr('altitude.fit'))
     long start = records[0].epochSecond as long
     long finish = records[-1].epochSecond as long
-    println String.format(Locale.ROOT, 'Walk           : %s, %s-%s local time', summary.date, clock(start, LOCAL_ZONE), clock(finish, LOCAL_ZONE))
-    Map notes = readWalkNotes(file)
+    printLine('walk', tr('walk', longDate(summary.date as LocalDate), clock(start), clock(finish)))
+    Map notes = readWalkText(file, 'notes', true)
     if (notes) {
-        println "How it felt${notes.draft ? ' (draft, unchecked)' : ''}: ${notes.text}"
+        printLine('howItFelt', walkTextMarks(notes) + notes.lines[0])
     }
 
     Map correction = null
@@ -1063,12 +1837,13 @@ Map analyse(java.io.File file, Options options) {
             correction = estimateStartError(records, new TerrainModel(new java.io.File(mapsDir, 'mdt05')))
             if (correction) {
                 correctStart(records, correction)
-                println String.format(Locale.ROOT, 'Start corrected: watch read %+.0f m against terrain, settling over %.0f m', correction.startError as double, correction.settleM as double)
+                printLine('startCorrected', tr('start.corrected', signed(correction.startError as double, 0) + NBSP + 'm',
+                    unit(correction.settleM as double, 0, 'm')))
             } else {
-                println 'Start checked against terrain: no settling error found, not corrected'
+                printLine('startCorrected', tr('start.notCorrected'))
             }
         } catch (Exception ex) {
-            System.err.println("IGN MDT05 terrain model unavailable (${ex.message}); start not corrected.")
+            System.err.println(tr('start.unavailable', ex.message))
         }
     }
 
@@ -1076,9 +1851,8 @@ Map analyse(java.io.File file, Options options) {
     double movingHours = (records.findAll { it.moving }.sum { it.dtS as double } ?: 0.0) / 3600.0
     double distanceKm = (session.totalDistanceM ?: records[-1].distance) / 1000.0
     double elapsedHours = (finish - start) / 3600.0
-    println String.format(Locale.ROOT, 'Distance       : %.2f km (watch)', distanceKm)
-    println String.format(Locale.ROOT, 'Time           : %s elapsed, %s moving (%.2f km/h), %s stopped',
-        formatHours(elapsedHours), formatHours(movingHours), distanceKm / movingHours, formatHours(elapsedHours - movingHours))
+    printLine('distance', tr('distance', unit(distanceKm, 2, 'km')))
+    printLine('time', tr('time', formatHours(elapsedHours), formatHours(movingHours), unit(distanceKm / movingHours, 2, 'km/h'), formatHours(elapsedHours - movingHours)))
     summary.km = distanceKm
     summary.movingHours = movingHours
     summary.elapsedHours = elapsedHours
@@ -1088,19 +1862,19 @@ Map analyse(java.io.File file, Options options) {
     double ascent = 0.0
     double descent = 0.0
     hysteresisSteps(altitudes, options.thresholdM).each { step -> if ((step[2] as double) > 0) { ascent += step[2] as double } else { descent -= step[2] as double } }
-    String watchTotal = session.totalAscentM != null ? " (watch's own total ${session.totalAscentM} m)" : ''
-    println String.format(Locale.ROOT, 'Ascent/descent : %.0f m / %.0f m at %.1f m threshold%s', ascent, descent, options.thresholdM, watchTotal)
-    println String.format(Locale.ROOT, 'Altitude range : %.0f-%.0f m', altitudes.min(), altitudes.max())
+    String watchTotal = session.totalAscentM != null ? tr('ascent.watchTotal', unit(session.totalAscentM as double, 0, 'm')) : ''
+    printLine('ascentDescent', tr('ascent', unit(ascent, 0, 'm'), unit(descent, 0, 'm'), unit(options.thresholdM, 1, 'm'), watchTotal))
+    printLine('altitudeRange', range(altitudes.min(), altitudes.max(), 0, 'm'))
     List<double[]> bands = gradientBands(altitudes, distances, options.thresholdM)
-    println 'Gradient band    ascent      descent'
-    gradientBandLabels().eachWithIndex { String label, int i ->
-        println String.format(Locale.ROOT, '  %-8s %6.0f m %3.0f%%  %6.0f m %3.0f%%', label,
-            bands[i][0], ascent > 0 ? bands[i][0] / ascent * 100.0 : 0.0, bands[i][1], descent > 0 ? bands[i][1] / descent * 100.0 : 0.0)
-    }
+    printTable([tr('bands.gradient'), tr('bands.ascent'), tr('bands.descent')],
+        (0..<bands.size()).collect { int i ->
+            [bandLabel(i), unit(bands[i][0], 0, 'm') + ' (' + pct(ascent > 0 ? bands[i][0] / ascent * 100.0 : 0.0, 0).padLeft(4) + ')',
+             unit(bands[i][1], 0, 'm') + ' (' + pct(descent > 0 ? bands[i][1] / descent * 100.0 : 0.0, 0).padLeft(4) + ')']
+        })
     int steepFrom = gradientBandIndex(15.0)
     double steepUp = bands.drop(steepFrom).sum { it[0] } as double
     double steepDown = bands.drop(steepFrom).sum { it[1] } as double
-    println String.format(Locale.ROOT, 'Steeper than 15%%: %.0f m up, %.0f m down', steepUp, steepDown)
+    println tr('steep', pct(15.0, 0), unit(steepUp, 0, 'm'), unit(steepDown, 0, 'm'))
     summary.ascent = ascent
     summary.descent = descent
     summary.steepUp = steepUp
@@ -1124,10 +1898,10 @@ Map analyse(java.io.File file, Options options) {
         }
         double meanMovingHr = movingSeconds > 0 ? hrSeconds / movingSeconds : Double.NaN
         double reservePct = (meanMovingHr - restingHr) / (maxHr - restingHr) * 100.0
-        println String.format(Locale.ROOT, 'Heart rate     : %s avg / %s max / %s min (watch); %.0f avg while moving, %.0f%% of heart-rate reserve (resting %d, max %d)',
-            session.avgHeartRate, session.maxHeartRate, session.minHeartRate, meanMovingHr, reservePct, restingHr, maxHr)
-        println String.format(Locale.ROOT, 'Net heartbeats : %.0f above resting while moving (%.0f per km, %.0f per moving minute)',
-            netBeats, netBeats / distanceKm, netBeats / (movingSeconds / 60.0))
+        Closure<String> bpm = { Object v -> v == null ? '–' : unit(v as double, 0, 'bpm') }
+        printLine('heartRate', tr('heartRate', bpm(session.avgHeartRate), bpm(session.maxHeartRate), bpm(session.minHeartRate),
+            bpm(meanMovingHr), pct(reservePct, 0), bpm(restingHr), bpm(maxHr)))
+        printLine('netBeats', tr('netBeats', num(netBeats, 0), num(netBeats / distanceKm, 0), num(netBeats / (movingSeconds / 60.0), 0)))
         summary.meanHr = meanMovingHr
         summary.netBeats = netBeats
         if (zones.highBoundaries && zones.timeS) {
@@ -1136,21 +1910,22 @@ Map analyse(java.io.File file, Options options) {
             double total = times.sum { (it ?: 0.0f) as double } as double
             List<String> parts = []
             for (int z = 0; z < times.size(); z++) {
-                String range = z == 0 ? "<${highs[0]}" : (z < highs.size() ? "${highs[z - 1]}-${highs[z]}" : ">${highs[-1]}")
-                parts << String.format(Locale.ROOT, 'Z%d %s %.0f%%', z, range, total > 0 ? ((times[z] ?: 0.0f) as double) / total * 100.0 : 0.0)
+                String zoneRange = z == 0 ? "<${highs[0]}" : (z < highs.size() ? "${highs[z - 1]}–${highs[z]}" : ">${highs[-1]}")
+                parts << "Z${z} ${zoneRange} ${pct(total > 0 ? ((times[z] ?: 0.0f) as double) / total * 100.0 : 0.0, 0)}"
             }
-            println "Heart-rate zones (watch): ${parts.join(' | ')}"
+            printLine('zones', tr('zones', parts.join(' | ')))
         }
         Map byGradient = heartRateByGradient(records, restingHr)
-        println String.format(Locale.ROOT, 'Heart rate by gradient while moving (heart rate %d s later; net beats per km relative to 0-5%%, flat = %.0f beats/km):', HR_LAG_S, byGradient.flatBeatsPerKm as double)
-        println '  Gradient     km   min   mean HR  beats/km  relative  Minetti 2002'
-        (byGradient.rows as List<Map>).each { row ->
-            List<Double> edges = [0.0] + GRADIENT_BAND_EDGES_PCT + [40.0]
-            int b = row.bandIndex as int
-            double midPct = (edges[b] + edges[b + 1]) / 2.0 * ((row.climb as boolean) ? 1 : -1)
-            println String.format(Locale.ROOT, '  %-9s %5.2f %5.0f   %6.0f    %6.0f     %5.2f       %5.2f',
-                row.label, row.km as double, row.minutes as double, row.meanHr as double, row.beatsPerKm as double, row.relative as double, minettiWalkingRelative(midPct / 100.0))
-        }
+        println tr('byGradient.title', unit(HR_LAG_S, 0, 's'), bandLabel(0), num(byGradient.flatBeatsPerKm as double, 0))
+        List<Double> edges = [0.0] + GRADIENT_BAND_EDGES_PCT + [40.0]
+        printTable([tr('bands.gradient'), tr('byGradient.km'), tr('byGradient.min'), tr('byGradient.meanHr'), tr('byGradient.beatsPerKm'),
+                    tr('byGradient.relative'), tr('byGradient.minetti')],
+            (byGradient.rows as List<Map>).collect { row ->
+                int b = row.bandIndex as int
+                double midPct = (edges[b] + edges[b + 1]) / 2.0 * ((row.climb as boolean) ? 1 : -1)
+                [bandLabel(b, row.climb as boolean), num(row.km as double, 2), num(row.minutes as double, 0), num(row.meanHr as double, 0),
+                 num(row.beatsPerKm as double, 0), num(row.relative as double, 2), num(minettiWalkingRelative(midPct / 100.0), 2)]
+            })
         summary.hrByGradient = byGradient
     }
 
@@ -1159,36 +1934,36 @@ Map analyse(java.io.File file, Options options) {
         long steps = (session.totalCycles as long) * 2
         List<Map> moving = records.findAll { it.moving && it.cadenceSpm != null }
         double meanCadence = moving ? (moving.sum { (it.cadenceSpm as double) * (it.dtS as double) } as double) / (moving.sum { it.dtS as double } as double) : Double.NaN
-        println String.format(Locale.ROOT, 'Steps          : %d (%.0f steps/min while moving, %.2f m average step)', steps, meanCadence, distanceKm * 1000.0 / steps)
+        printLine('steps', tr('steps', num(steps, 0), num(meanCadence, 0), unit(distanceKm * 1000.0 / steps, 2, 'm')))
         summary.steps = steps
     }
 
     // Energy and the watch's own effort figures.
     List<String> energy = []
     if (session.totalCalories != null) {
-        energy << "${session.totalCalories} kcal"
+        energy << unit(session.totalCalories as double, 0, 'kcal')
         summary.kcal = session.totalCalories
     }
     if (session.avgMets != null) {
-        energy << String.format(Locale.ROOT, '%.1f METs average', session.avgMets as double)
+        energy << tr('energy.mets', num(session.avgMets as double, 1))
     }
     if (session.trainingLoad != null) {
-        energy << String.format(Locale.ROOT, 'training load %.0f', session.trainingLoad as double)
+        energy << tr('energy.load', num(session.trainingLoad as double, 0))
         summary.trainingLoad = session.trainingLoad
     }
     if (session.rpe != null) {
-        energy << String.format(Locale.ROOT, 'effort %.0f/10%s', session.rpe as double, session.rpeEstimated ? ' (estimated by the watch)' : '')
+        energy << tr('energy.effort', num(session.rpe as double, 0), session.rpeEstimated ? tr('energy.estimated') : '')
         summary.rpe = session.rpe
     }
     if (energy) {
-        println "Energy/effort  : ${energy.join(', ')}"
+        printLine('energy', energy.join(', '))
     }
 
     // Weather: the watch's single value is the weather at the start; Open-Meteo along the route
     // gives the real range.
     if (session.weatherTemp != null) {
-        String humidity = session.weatherHumidity != null ? String.format(Locale.ROOT, ', humidity %.0f%%', session.weatherHumidity as double) : ''
-        println "Watch weather  : ${session.weatherTemp} degC${humidity} (one value per walk: the weather at the start, not an average)"
+        String humidity = session.weatherHumidity != null ? tr('watchWeather.humidity', pct(session.weatherHumidity as double, 0)) : ''
+        printLine('watchWeather', tr('watchWeather', unit(session.weatherTemp as double, 0, '°C'), humidity))
     }
     if (!options.noWeather) {
         try {
@@ -1197,10 +1972,10 @@ Map analyse(java.io.File file, Options options) {
             List<Map> valid = weather.findAll { it.temperature != null }
             if (valid) {
                 Map hottest = valid.max { it.temperature as double }
-                println String.format(Locale.ROOT, 'Weather (Open-Meteo, every 15 min): %.0f-%.0f degC, mean %.0f degC; hottest %.0f degC at %s; direct sun up to %.0f W/m2',
-                    valid.min { it.temperature as double }.temperature as double, hottest.temperature as double,
-                    (valid.sum { it.temperature as double } as double) / valid.size(), hottest.temperature as double,
-                    clock(hottest.epochSecond as long, LOCAL_ZONE), valid.max { (it.radiation ?: 0.0) as double }.radiation as double)
+                double meanTemp = (valid.sum { it.temperature as double } as double) / valid.size()
+                printLine('weather', tr('weather', range(valid.min { it.temperature as double }.temperature as double, hottest.temperature as double, 0, '°C'),
+                    unit(meanTemp, 0, '°C'), unit(hottest.temperature as double, 0, '°C'), clock(hottest.epochSecond as long),
+                    unit(valid.max { (it.radiation ?: 0.0) as double }.radiation as double, 0, 'W/m²')))
                 List<Map> heat = valid.findAll { it.humidity != null && it.dni != null && it.wind != null }.collect { s ->
                     LocalDateTime utc = LocalDateTime.ofEpochSecond(s.epochSecond as long, 0, ZoneOffset.UTC)
                     double altitude = ThermalComfort.solarAltitudeDeg(s.lat as double, s.lon as double, utc)
@@ -1211,22 +1986,58 @@ Map analyse(java.io.File file, Options options) {
                 }.findAll { !Double.isNaN(it.shade as double) && !Double.isNaN(it.sun as double) }
                 List<Map> sunny = heat.findAll { it.sunny }
                 if (heat) {
-                    println String.format(Locale.ROOT, 'Sunshine       : %.0f%% of the walk (direct sun >= %.0f W/m2)', sunny.size() * 100.0 / heat.size(), ThermalComfort.SUNNY_DNI_W_M2)
-                    summary.meanTemp = (valid.sum { it.temperature as double } as double) / valid.size()
+                    printLine('sunshine', tr('sunshine', pct(sunny.size() * 100.0 / heat.size(), 0), unit(ThermalComfort.SUNNY_DNI_W_M2, 0, 'W/m²')))
+                    summary.meanTemp = meanTemp
                 }
                 if (sunny) {
                     Map peak = sunny.max { it.sun as double }
-                    println String.format(Locale.ROOT, 'Felt heat (UTCI) while sunny: shade %.0f degC, full sun %.0f degC (means); peak in full sun %.0f degC at %s (%s)',
-                        (sunny.sum { it.shade as double } as double) / sunny.size(), (sunny.sum { it.sun as double } as double) / sunny.size(),
-                        peak.sun as double, clock((peak.sample as Map).epochSecond as long, LOCAL_ZONE), ThermalComfort.heatStressCategory(peak.sun as double))
+                    printLine('feltHeat', tr('feltHeat', unit((sunny.sum { it.shade as double } as double) / sunny.size(), 0, '°C'),
+                        unit((sunny.sum { it.sun as double } as double) / sunny.size(), 0, '°C'), unit(peak.sun as double, 0, '°C'),
+                        clock((peak.sample as Map).epochSecond as long), tr('heat.' + ThermalComfort.heatStressCategory(peak.sun as double))))
                     summary.meanSunUtci = (sunny.sum { it.sun as double } as double) / sunny.size()
                 }
             }
         } catch (Exception ex) {
-            System.err.println("Open-Meteo request failed (${ex.message}); no weather along the route.")
+            System.err.println(tr('weather.failed', ex.message))
         }
     }
+
+    // Highlights: the checked (or draft) file in the report language, after drafting one from
+    // OpenStreetMap and the recorded data where none exists yet.
+    if (!options.noHighlights) {
+        List<Map> positioned = records.findAll { it.lat != null }
+        Map osm = null
+        try {
+            osm = fetchOsmFeatures(positioned, new java.io.File(mapsDir, "${baseName}.osm-highlights.json"))
+        } catch (Exception ex) {
+            System.err.println(tr('hl.failed', ex.message))
+        }
+        Map highlights = routeHighlights(records, osm)
+        if (osm != null) {
+            writeDraftHighlights(file, highlights, options.redraft)
+        } else if (!readWalkText(file, 'highlights', false)) {
+            printLine('highlights', '(' + tr('draft') + ')')
+            highlightLines(highlights, lang).each { println "  ${it}" }
+        }
+    }
+    Map highlightText = readWalkText(file, 'highlights', false)
+    if (highlightText) {
+        printLine('highlights', walkTextMarks(highlightText).trim())
+        (highlightText.lines as List<String>).each { println "  ${it}" }
+    }
     summary
+}
+
+// "(draft, unchecked, in Finnish) " and the like, for a note or highlights file.
+String walkTextMarks(Map text) {
+    List<String> marks = []
+    if (text.draft) {
+        marks << tr('draft')
+    }
+    if (text.fallback) {
+        marks << tr('fallback')
+    }
+    marks ? '(' + marks.join(', ') + ') ' : ''
 }
 
 // ----- main -----
@@ -1248,11 +2059,20 @@ if (cmd.isVersionHelpRequested()) {
     cmd.printVersionHelp(System.out)
     System.exit(0)
 }
+if (!(options.language in LANGUAGES)) {
+    System.err.println("Unknown language '${options.language}': use one of ${LANGUAGES.join(', ')}")
+    System.exit(2)
+}
+lang = options.language
+// The report uses non-ASCII characters (°C, en dashes, hard spaces, Finnish letters), so write
+// it as UTF-8 whatever the platform default.
+System.setOut(new PrintStream(new FileOutputStream(FileDescriptor.out), true, 'UTF-8'))
+System.setErr(new PrintStream(new FileOutputStream(FileDescriptor.err), true, 'UTF-8'))
 
 List<Map> summaries = []
 for (java.io.File file : options.files) {
     if (!file.exists()) {
-        System.err.println("Input file not found: ${file}")
+        System.err.println(tr('input.notFound', file))
         continue
     }
     summaries << analyse(file, options)
@@ -1280,7 +2100,7 @@ Map pooledEffortCurve(List<Map> summaries) {
         Map row = meta[label]
         int b = row.bandIndex as int
         double mid = (edges[b] + edges[b + 1]) / 2.0 * ((row.climb as boolean) ? 1 : -1)
-        [label: label, gradePct: mid, km: acc[0], factor: acc[1] / acc[0]]
+        [label: label, bandIndex: b, climb: row.climb, gradePct: mid, km: acc[0], factor: acc[1] / acc[0]]
     }.sort { it.gradePct as double }
     Closure<Double> factorFor = { String label -> pooled[label] && pooled[label][0] >= 1.0 ? pooled[label][1] / pooled[label][0] : Double.NaN }
 
@@ -1321,31 +2141,30 @@ if (summaries.size() > 1) {
     Map curve = pooledEffortCurve(summaries)
     if (curve.anchors) {
         println ''
-        println "=== Personal effort curve from ${summaries.count { it.hrByGradient }} walks ==="
-        println 'Net heartbeats per km relative to near-flat walking, pooled by distance (bands under 1 km left out):'
-        println '  Gradient  mid %      km  factor  Minetti 2002'
-        (curve.anchors as List<Map>).each { a ->
-            println String.format(Locale.ROOT, '  %-8s %6.1f  %6.1f   %5.2f       %5.2f', a.label, a.gradePct as double, a.km as double, a.factor as double, minettiWalkingRelative((a.gradePct as double) / 100.0))
-        }
-        println 'As anchors [grade %, factor]: ' + (curve.anchors as List<Map>).collect { String.format(Locale.ROOT, '[%.1f, %.2f]', it.gradePct as double, it.factor as double) }.join(', ')
+        println "=== ${tr('curve.title', summaries.count { it.hrByGradient })} ==="
+        println tr('curve.intro')
+        printTable([tr('bands.gradient'), tr('curve.mid'), 'km', tr('curve.factor'), tr('byGradient.minetti')],
+            (curve.anchors as List<Map>).collect { a ->
+                [bandLabel(a.bandIndex as int, a.climb as boolean), pct(a.gradePct as double, 1), num(a.km as double, 1),
+                 num(a.factor as double, 2), num(minettiWalkingRelative((a.gradePct as double) / 100.0), 2)]
+            })
+        // For pasting into ElevationProfiler's code, so always in code notation.
+        println tr('curve.anchors') + (curve.anchors as List<Map>).collect { String.format(Locale.ROOT, '[%.1f, %.2f]', it.gradePct as double, it.factor as double) }.join(', ')
         if (curve.heat) {
             Map h = curve.heat as Map
-            println String.format(Locale.ROOT, 'Heat: net heartbeats per km of that cost rise %.1f%% per degC of mean air temperature (relative to 20 degC; %d walks, %.0f-%.0f degC)',
-                h.pctPerDegAt20 as double, h.walks as int, h.minTemp as double, h.maxTemp as double)
+            println tr('curve.heat', pct(h.pctPerDegAt20 as double, 1), num(h.walks as double, 0), range(h.minTemp as double, h.maxTemp as double, 0, '°C'))
         }
     }
 
     println ''
-    println '=== All walks ==='
-    println 'Date        km   up(m) down(m) steep up/down  moving   avg HR  net beats  beats/km   kcal  load  effort  air degC  sun UTCI'
-    summaries.each { s ->
-        println String.format(Locale.ROOT, '%s %5.1f %6.0f %6.0f    %4.0f/%-4.0f    %s  %5.0f  %8.0f  %7.0f  %6s %5s  %5s   %6s   %6s',
-            s.date, s.km as double, s.ascent as double, s.descent as double, s.steepUp as double, s.steepDown as double,
-            formatHours(s.movingHours as double), (s.meanHr ?: Double.NaN) as double, (s.netBeats ?: Double.NaN) as double,
-            s.netBeats != null ? (s.netBeats as double) / (s.km as double) : Double.NaN,
-            s.kcal ?: '-', s.trainingLoad != null ? String.format(Locale.ROOT, '%.0f', s.trainingLoad as double) : '-',
-            s.rpe != null ? String.format(Locale.ROOT, '%.0f', s.rpe as double) : '-',
-            s.meanTemp != null ? String.format(Locale.ROOT, '%.0f', s.meanTemp as double) : '-',
-            s.meanSunUtci != null ? String.format(Locale.ROOT, '%.0f', s.meanSunUtci as double) : '-')
-    }
+    println "=== ${tr('all.title')} ==="
+    Closure<String> orDash = { Object v, int decimals -> v == null ? '–' : num(v as double, decimals) }
+    printTable([tr('all.date'), 'km', tr('all.up') + ' (m)', tr('all.down') + ' (m)', tr('all.steep') + ' (m)', tr('all.moving'), tr('all.hr'),
+                tr('all.netBeats'), tr('all.beatsPerKm'), 'kcal', tr('all.load'), tr('all.effort'), tr('all.air') + ' (°C)', tr('all.sunUtci') + ' (°C)'],
+        summaries.collect { s ->
+            [shortDate(s.date as LocalDate), num(s.km as double, 1), num(s.ascent as double, 0), num(s.descent as double, 0),
+             num(s.steepUp as double, 0) + '/' + num(s.steepDown as double, 0), formatHours(s.movingHours as double), orDash(s.meanHr, 0),
+             orDash(s.netBeats, 0), s.netBeats != null ? num((s.netBeats as double) / (s.km as double), 0) : '–', orDash(s.kcal, 0),
+             orDash(s.trainingLoad, 0), orDash(s.rpe, 0), orDash(s.meanTemp, 0), orDash(s.meanSunUtci, 0)]
+        }, '')
 }
