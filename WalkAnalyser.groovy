@@ -521,10 +521,15 @@ class ThermalComfort {
 @Field final double EPSILON_M = 1e-6
 @Field final List<Double> GRADIENT_BAND_EDGES_PCT = [5.0, 10.0, 15.0, 20.0, 30.0]
 @Field final double GRADIENT_BASELINE_M = 25.0
-// Moving means faster than this over a 20 s window - slower is standing, map-reading or
-// photo stops rather than walking, even on the steepest climbs.
+// Moving means faster than this over a 20 s window, or climbing or descending faster than
+// MOVING_VERTICAL_M_S over a minute: on a steep climb the horizontal speed can drop to a few
+// metres a minute while the walker is still gaining 3–7 m of height a minute. A pause shorter
+// than MIN_STOP_S (a hesitation, a look round) counts as moving.
 @Field final double MOVING_SPEED_M_S = 0.5
 @Field final double MOVING_WINDOW_S = 20.0
+@Field final double MOVING_VERTICAL_M_S = 0.05
+@Field final double MOVING_VERTICAL_WINDOW_S = 60.0
+@Field final double MIN_STOP_S = 30.0
 // Heart rate trails a change in effort by roughly half a minute, so each stretch of track is
 // paired with the heart rate this long after it when splitting by gradient.
 @Field final int HR_LAG_S = 30
@@ -1332,10 +1337,11 @@ void correctStart(List<Map> records, Map correction) {
     }
 }
 
-// Marks each record as moving or not (speed over MOVING_WINDOW_S above MOVING_SPEED_M_S, and no
-// recording gap over 10 s), and stores the seconds since the previous record.
+// Marks each record as moving or not (see MOVING_SPEED_M_S; a recording gap over 10 s is never
+// moving), and stores the seconds since the previous record.
 void markMoving(List<Map> records) {
     int a = 0
+    int v = 0
     records[0].moving = false
     records[0].dtS = 0.0d
     for (int i = 1; i < records.size(); i++) {
@@ -1343,11 +1349,35 @@ void markMoving(List<Map> records) {
         while (t - (records[a].epochSecond as long) > MOVING_WINDOW_S) {
             a++
         }
+        while (t - (records[v].epochSecond as long) > MOVING_VERTICAL_WINDOW_S) {
+            v++
+        }
         long span = t - (records[a].epochSecond as long)
         double speed = span > 0 ? ((records[i].distance as double) - (records[a].distance as double)) / span : 0.0
+        long verticalSpan = t - (records[v].epochSecond as long)
+        double verticalSpeed = verticalSpan > 0 && records[i].altitude != null && records[v].altitude != null ?
+            Math.abs((records[i].altitude as double) - (records[v].altitude as double)) / verticalSpan : 0.0
         double dt = t - (records[i - 1].epochSecond as long)
         records[i].dtS = dt
-        records[i].moving = dt <= 10.0 && speed > MOVING_SPEED_M_S
+        records[i].moving = dt <= 10.0 && (speed > MOVING_SPEED_M_S || verticalSpeed > MOVING_VERTICAL_M_S)
+    }
+    // Short pauses count as moving, unless they contain a recording gap.
+    int i = 1
+    while (i < records.size()) {
+        if (records[i].moving) {
+            i++
+            continue
+        }
+        int j = i
+        while (j < records.size() && !records[j].moving) {
+            j++
+        }
+        List<Map> pause = records.subList(i, j)
+        double seconds = pause.sum { it.dtS as double } as double
+        if (j < records.size() && seconds < MIN_STOP_S && pause.every { (it.dtS as double) <= 10.0 }) {
+            pause.each { it.moving = true }
+        }
+        i = j
     }
 }
 

@@ -268,8 +268,11 @@ to the input file or one level up (`--maps` to choose), so walks under
 `gpx/real_world/` share the profiler's `gpx/maps/mdt05/` tiles. For each
 walk it reports:
 
-- **Time and distance**: elapsed, moving (faster than 0.5 m/s over 20 s)
-  and stopped time, and the watch's distance.
+- **Time and distance**: elapsed, moving and stopped time, and the
+  watch's distance. Moving means faster than 0.5 m/s over 20 s, or
+  climbing or descending faster than 3 m a minute (on a steep climb the
+  horizontal speed alone looks like standing still); pauses under 30 s
+  count as moving.
 - **Ascent and descent**: a hysteresis filter at 0.4 m (`-t`), suited to
   the watch's already smoothed barometric altitude at full precision
   (GPS-only altitude from other devices needs about 3 m), with the watch's
