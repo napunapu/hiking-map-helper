@@ -250,7 +250,7 @@ on an Apple Watch and exported from HealthFit as FIT plus GPX with the
 same name:
 
 ```sh
-groovy WalkAnalyser.groovy [-l en|fi] [-t <m>] [--no-terrain-start] [--no-weather] [--no-highlights] [--redraft] [-o <report.md>] [--no-report] [--fit-altitude] [--maps <dir>] <walk.fit> [...]
+groovy WalkAnalyser.groovy [-l en|fi] [-t <m>] [--no-terrain-start] [--no-weather] [--no-highlights] [--redraft] [-o <report.md>] [--no-report] [--slides] [--slides-file <slides.html>] [--fit-altitude] [--maps <dir>] <walk.fit> [...]
 ```
 
 The report is in English by default and in Finnish with `-l fi`
@@ -353,6 +353,35 @@ skips it. The report opens with the table of all walks, then gives each
 walk's notes and highlights followed by its figures and tables, and ends
 with the personal effort curve. It is personal data like the notes, so it
 stays under `gpx/`. The HTML profiles with diagrams stay separate.
+
+With `--slides`, it also writes a slide deck for showing the trip to
+others: one 16:9 page per walk, with the route on an OpenStreetMap map,
+distance, time with breaks, ascent and descent, the high point, the
+places along the way from the highlights file (up to eight, lettered on
+the map, in the list and on the profile), and the day's temperature by
+hour above the elevation profile, breaks of three minutes or more marked
+on both. Heart rate and other effort figures are left out on purpose. The
+deck is `walk-slides.html` (`walk-slides.fi.html` in Finnish) next to the
+first input file, or wherever `--slides-file` says, and is printed to a
+PDF beside it when Google Chrome or Chromium is installed; otherwise open
+the HTML in a browser and print it (the page size is set to 16:9). Map
+tiles are cached in `maps/tiles/osm/`, as the OpenStreetMap tile usage
+policy asks, and the map credits OpenStreetMap's contributors.
+
+The text above the title comes from an optional caption file,
+`<walk>.caption.txt` or `<walk>.caption.fi.txt`, which works like the
+notes:
+
+```text
+Label: GR 92 · stage 12
+Title: Lloret de Mar – Tordera
+Coastal path past coves and over the castle hill, then flat country inland
+```
+
+`Label:` (`Yläotsikko:` in Finnish) goes before the date in the small line
+above the title, `Title:` (`Otsikko:`) replaces the route from the
+highlights file as the title, and any other line is the description under
+the title. Each part is optional.
 
 With several files, a final table compares the walks side by side. Its
 ascent, descent and steep figures reproduce the separate Python analyser
