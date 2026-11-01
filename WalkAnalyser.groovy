@@ -28,6 +28,9 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import java.time.format.TextStyle
+import java.util.regex.Matcher
+import java.util.regex.Pattern
 
 @Command(
     name = 'WalkAnalyser',
@@ -66,6 +69,12 @@ class Options {
 
     @Option(names = ['--no-report'], description = 'Don\'t write the combined Markdown report, only print to the console')
     boolean noReport = false
+
+    @Option(names = ['--slides'], description = 'Also write a slide deck, one 16:9 page per walk with the map, key figures, places along the way and weather, as HTML and (with Google Chrome or Chromium installed) PDF')
+    boolean slides = false
+
+    @Option(names = ['--slides-file'], description = 'Where to write the slide deck (default: walk-slides.html, or walk-slides.fi.html in Finnish, next to the first input file; the PDF goes beside it)')
+    java.io.File slidesFile
 
     @Option(names = ['--maps'], description = 'Cache folder for terrain tiles, weather and OpenStreetMap features (default: the nearest existing maps/ folder next to the input file or one level up, otherwise maps/ next to the input file)')
     java.io.File mapsDir
@@ -657,7 +666,34 @@ class ThermalComfort {
         'kind.waterfall': 'waterfall',
         'kind.cave': 'cave',
         'kind.museum': 'museum',
-        'kind.attraction': 'attraction'
+        'kind.attraction': 'attraction',
+        'slide.labelKey': 'Label:',
+        'slide.titleKey': 'Title:',
+        'slide.when': '%s %s · %s–%s',
+        'slide.distance': 'Distance',
+        'slide.onFoot': 'on foot',
+        'slide.time': 'Time',
+        'slide.breaks': 'including %s of breaks',
+        'slide.ascent': 'Ascent',
+        'slide.descent': 'and %s of descent',
+        'slide.highPoint': 'High point',
+        'slide.along': 'Along the way',
+        'slide.noPlaces': 'No named places along the route',
+        'slide.air': 'Air, °C',
+        'slide.elevation': 'Elevation',
+        'slide.humidity': 'Humidity %s, wind %s',
+        'slide.sky.sunny': 'sunny',
+        'slide.sky.partly': 'partly cloudy',
+        'slide.sky.cloudy': 'cloudy',
+        'slide.sky.change': '%s at first, then %s',
+        'slide.osm': '© OpenStreetMap contributors',
+        'slide.north': 'N',
+        'slide.title': 'Day slides',
+        'slide.written': 'Slides written to %s',
+        'slide.pdf': 'PDF written to %s',
+        'slide.noChrome': 'No Google Chrome or Chromium found for the PDF: open %s in a browser and print it (the page size is set to 16:9).',
+        'slide.pdfFailed': 'Printing the slides to PDF failed (%s).',
+        'slide.tilesFailed': 'Map tiles unavailable (%s); the map is drawn without a background.'
     ],
     fi: [
         'label.altitudeFrom': 'Korkeuslähde',
@@ -772,7 +808,34 @@ class ThermalComfort {
         'kind.waterfall': 'vesiputous',
         'kind.cave': 'luola',
         'kind.museum': 'museo',
-        'kind.attraction': 'nähtävyys'
+        'kind.attraction': 'nähtävyys',
+        'slide.labelKey': 'Yläotsikko:',
+        'slide.titleKey': 'Otsikko:',
+        'slide.when': '%s %s · klo %s–%s',
+        'slide.distance': 'Matka',
+        'slide.onFoot': 'jalan',
+        'slide.time': 'Aika',
+        'slide.breaks': 'josta taukoja %s',
+        'slide.ascent': 'Nousua',
+        'slide.descent': 'ja laskua %s',
+        'slide.highPoint': 'Korkein kohta',
+        'slide.along': 'Matkan varrella',
+        'slide.noPlaces': 'Ei nimettyjä kohteita reitin varrella',
+        'slide.air': 'Ilma, °C',
+        'slide.elevation': 'Korkeus',
+        'slide.humidity': 'Ilmankosteus %s, tuulta %s',
+        'slide.sky.sunny': 'aurinkoista',
+        'slide.sky.partly': 'puolipilvistä',
+        'slide.sky.cloudy': 'pilvistä',
+        'slide.sky.change': 'aluksi %s, sitten %s',
+        'slide.osm': '© OpenStreetMapin tekijät',
+        'slide.north': 'P',
+        'slide.title': 'Päiväsivut',
+        'slide.written': 'Diat kirjoitettu: %s',
+        'slide.pdf': 'PDF kirjoitettu: %s',
+        'slide.noChrome': 'PDF:ää varten ei löytynyt Google Chromea tai Chromiumia: avaa %s selaimessa ja tulosta se (sivukoko on 16:9).',
+        'slide.pdfFailed': 'Diojen tulostus PDF:ksi epäonnistui (%s).',
+        'slide.tilesFailed': 'Karttatiiliä ei saatu (%s); kartta piirretään ilman taustaa.'
     ]
 ]
 
@@ -1017,7 +1080,7 @@ java.io.File matchingGpx(java.io.File fitFile) {
 }
 
 java.io.File matchingSibling(java.io.File fitFile, String suffix) {
-    Closure<String> stem = { String name -> name.replaceFirst(/(?i)\.(fit|gpx|(notes|highlights)(\.[a-z]{2})?\.txt)$/, '').replaceAll(/[\s\u00a0]+/, ' ') }
+    Closure<String> stem = { String name -> name.replaceFirst(/(?i)\.(fit|gpx|(notes|highlights|caption)(\.[a-z]{2})?\.txt)$/, '').replaceAll(/[\s\u00a0]+/, ' ') }
     String wanted = stem(fitFile.name)
     fitFile.absoluteFile.parentFile.listFiles()?.find { it.name.toLowerCase().endsWith(suffix) && stem(it.name) == wanted }
 }
@@ -2149,10 +2212,11 @@ Map analyse(java.io.File file, Options options) {
         String humidity = session.weatherHumidity != null ? tr('watchWeather.humidity', pct(session.weatherHumidity as double, 0)) : ''
         printLine('watchWeather', tr('watchWeather', unit(session.weatherTemp as double, 0, '°C'), humidity))
     }
+    List<Map> weather = []
     if (!options.noWeather) {
         try {
             String day = summary.date.toString()
-            List<Map> weather = weatherAlongWalk(records, new java.io.File(mapsDir, "${baseName}.weather.${day}.json"))
+            weather = weatherAlongWalk(records, new java.io.File(mapsDir, "${baseName}.weather.${day}.json"))
             List<Map> valid = weather.findAll { it.temperature != null }
             if (valid) {
                 Map hottest = valid.max { it.temperature as double }
@@ -2186,6 +2250,9 @@ Map analyse(java.io.File file, Options options) {
         }
     }
 
+    if (options.slides) {
+        summary.slide = slideData(file, records, summary, weather, mapsDir)
+    }
     summary
 }
 
@@ -2200,6 +2267,512 @@ String walkTextMarks(Map text) {
     }
     marks ? '(' + marks.join(', ') + ') ' : ''
 }
+
+// ----- slides -----
+
+// One 16:9 page per walk, meant for showing the trip to others rather than for analysis: the
+// route on an OpenStreetMap background, the key figures, the places along the way from the
+// highlights file, and the day's temperature above the elevation profile. Written as one HTML
+// deck (vector graphics, print size 1920 x 1080 px) and printed to PDF with headless Chrome
+// or Chromium when one is installed; Keynote and PowerPoint take the PDF a page at a time.
+
+@Field final double SLIDE_STOP_MIN_S = 180.0
+@Field final int SLIDE_MAX_PLACES = 8
+@Field final double SLIDE_PLACE_MERGE_KM = 0.15
+@Field final int SLIDE_SAMPLE_S = 15
+// The map panel on the slide, in slide pixels, and the margin the route keeps from its edges.
+@Field final List<Double> SLIDE_MAP_BOX = [80.0, 250.0, 560.0, 490.0]
+@Field final String TILE_USER_AGENT = 'WalkAnalyser/1.0 (+https://github.com/napunapu/hiking-map-helper)'
+
+// A message template as a regular expression, each %s a group (lazy unless given): reads back
+// the lines that highlightLines wrote, or that were edited to the same pattern.
+Pattern messagePattern(String language, String key, List<String> groups = []) {
+    String template = MESSAGES[language][key] ?: MESSAGES.en[key]
+    List<String> pieces = template.split('%s', -1) as List<String>
+    StringBuilder regex = new StringBuilder('^').append(Pattern.quote(pieces[0]))
+    for (int i = 1; i < pieces.size(); i++) {
+        regex.append(groups[i - 1] ?: '(.*?)').append(Pattern.quote(pieces[i]))
+    }
+    Pattern.compile(regex.append('$').toString(), Pattern.CASE_INSENSITIVE)
+}
+
+String typographic(String text) {
+    text?.replace("'", '’')
+}
+
+// Route, places and high-point name from the highlights file, in whichever language it was
+// found in. Stop-only lines are left out; places closer than 150 m along the route count once,
+// and of more than eight the most bunched are dropped.
+Map slideHighlights(java.io.File file) {
+    Map text = readWalkText(file, 'highlights', false)
+    if (!text) {
+        return [places: []]
+    }
+    String language = text.fallback ? (LANGUAGES - lang)[0] : lang
+    Pattern item = messagePattern(language, 'hl.item')
+    Pattern high = messagePattern(language, 'hl.highPoint', ['(.*?)', '([0-9.,]+)', '(.*)'])
+    Pattern route = messagePattern(language, 'hl.route')
+    String stopTemplate = MESSAGES[language]['hl.stop']
+    String stop = stopTemplate.split('%s', -1).collect { Pattern.quote(it) }.join('\\d+')
+    Map result = [places: []]
+    (text.lines as List<String>).each { String line ->
+        String plain = line.replace(NBSP, ' ')
+        Matcher m
+        if ((m = route.matcher(plain)).matches()) {
+            result.route = typographic(m.group(1))
+        } else if ((m = high.matcher(plain)).matches()) {
+            String name = m.group(3).trim()
+            result.highName = name.startsWith('(') && name.endsWith(')') ? typographic(name[1..-2]) : null
+        } else if ((m = item.matcher(plain)).matches()) {
+            String what = m.group(3)
+            if (Pattern.matches('(?i)' + stop, what)) {
+                return
+            }
+            what = what.replaceFirst(' – ' + stop + '$', '')
+            List<String> parts = what.split(', ') as List<String>
+            String name
+            String kind
+            if (parts.size() >= 3 && parts[-1] ==~ /[0-9 ]+ m/) {
+                name = parts[0..-3].join(', ')
+                kind = parts[-2] + ', ' + parts[-1].replaceFirst(/ m$/, NBSP + 'm')
+            } else if (parts.size() >= 2) {
+                name = parts[0..-2].join(', ')
+                kind = parts[-1]
+            } else {
+                name = what
+                kind = ''
+            }
+            double km = m.group(1).replace(',', '.').replace(' ', '') as double
+            List<Map> places = result.places as List<Map>
+            if (!places || km - (places[-1].km as double) >= SLIDE_PLACE_MERGE_KM) {
+                places << [km: km, time: m.group(2).replaceFirst(/^klo /, ''), name: typographic(name), kind: kind]
+            }
+        }
+    }
+    List<Map> places = result.places as List<Map>
+    while (places.size() > SLIDE_MAX_PLACES) {
+        int tightest = (1..<places.size()).min { int i -> (places[i].km as double) - (places[i - 1].km as double) }
+        places.removeAt(tightest)
+    }
+    result
+}
+
+// The caption file, <walk>.caption.txt or <walk>.caption.fi.txt: a line under the title
+// describing the route, with optional "Label:" and "Title:" lines ("Yläotsikko:" and
+// "Otsikko:" in Finnish) for the small text above the title and to replace the route as the
+// title. Lines starting with # are comments, as in the notes.
+Map slideCaption(java.io.File file) {
+    Map text = readWalkText(file, 'caption', false)
+    Map result = [:]
+    if (!text) {
+        return result
+    }
+    String language = text.fallback ? (LANGUAGES - lang)[0] : lang
+    List<String> description = []
+    (text.lines as List<String>).each { String line ->
+        String label = trIn(language, 'slide.labelKey')
+        String title = trIn(language, 'slide.titleKey')
+        if (line.startsWith(label)) {
+            result.label = typographic(line.substring(label.length()).trim())
+        } else if (line.startsWith(title)) {
+            result.title = typographic(line.substring(title.length()).trim())
+        } else {
+            description << line
+        }
+    }
+    if (description) {
+        result.description = typographic(description.join(' '))
+    }
+    result
+}
+
+// Temperature by hour of the day, the header's range, humidity and wind, and the sky in words:
+// sunny when at least 70% of the samples had sunshine (direct normal irradiance of 120 W/m² or
+// more, the WMO definition), partly cloudy from 30%, otherwise cloudy, told separately for the
+// first and second half of the walk when they differ.
+Map slideWeather(List<Map> weather) {
+    List<Map> valid = weather.findAll { it.temperature != null }
+    if (!valid) {
+        return null
+    }
+    Map<Integer, List<Double>> byHour = new TreeMap<>()
+    valid.each { s ->
+        int hour = Instant.ofEpochSecond(s.epochSecond as long).atZone(LOCAL_ZONE).hour
+        byHour.computeIfAbsent(hour) { [] } << (s.temperature as double)
+    }
+    List<Map> hours = byHour.collect { int hour, List<Double> temps ->
+        double mean = (temps.sum() as double) / temps.size()
+        [h: hour, temp: mean, label: num(mean, 0)]
+    }
+    List<Boolean> sunny = valid.findAll { it.dni != null }.collect { s ->
+        LocalDateTime utc = LocalDateTime.ofEpochSecond(s.epochSecond as long, 0, ZoneOffset.UTC)
+        ThermalComfort.solarAltitudeDeg(s.lat as double, s.lon as double, utc) > 0 && (s.dni as double) >= ThermalComfort.SUNNY_DNI_W_M2
+    }
+    Closure<String> sky = { List<Boolean> flags ->
+        double share = flags.count { it } / (double) flags.size()
+        tr(share >= 0.7 ? 'slide.sky.sunny' : share >= 0.3 ? 'slide.sky.partly' : 'slide.sky.cloudy')
+    }
+    String skyText = ''
+    if (sunny) {
+        int half = sunny.size().intdiv(2)
+        String first = sky(half > 0 ? sunny.take(half) : sunny)
+        String second = sky(half > 0 ? sunny.drop(half) : sunny)
+        skyText = (first == second ? first : tr('slide.sky.change', first, second)).capitalize()
+    }
+    Closure<String> spread = { String field, String symbol ->
+        List<Double> values = valid.findAll { it[field] != null }.collect { Math.round(it[field] as double) as double }
+        values ? (values.min() == values.max() ? (symbol == '%' ? pct(values.min(), 0) : unit(values.min(), 0, symbol)) : range(values.min(), values.max(), 0, symbol)) : '–'
+    }
+    double low = valid.min { it.temperature as double }.temperature as double
+    double highest = valid.max { it.temperature as double }.temperature as double
+    [hours: hours, sky: skyText,
+     temps: Math.round(low) == Math.round(highest) ? unit(low, 0, '°C') : range(low, highest, 0, '°C'),
+     humidity: tr('slide.humidity', spread('humidity', '%'), spread('wind', 'm/s'))]
+}
+
+// An OpenStreetMap standard tile, cached under maps/tiles/osm/ (the tile usage policy asks for
+// caching and an identifying user agent).
+byte[] mapTile(int zoom, int x, int y, java.io.File cacheDir) {
+    java.io.File tile = new java.io.File(cacheDir, "${zoom}/${x}/${y}.png")
+    if (!tile.exists()) {
+        HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
+        HttpRequest request = HttpRequest.newBuilder().uri(URI.create("https://tile.openstreetmap.org/${zoom}/${x}/${y}.png"))
+            .header('User-Agent', TILE_USER_AGENT).timeout(Duration.ofSeconds(30)).GET().build()
+        HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray())
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("HTTP ${response.statusCode()}")
+        }
+        tile.parentFile.mkdirs()
+        tile.bytes = response.body()
+    }
+    tile.bytes
+}
+
+// Web Mercator placement of the route in the map panel, at the whole zoom level nearest to
+// the scale that fits it, with the tiles behind it embedded as data URIs.
+Map slideMap(List<List> series, java.io.File mapsDir) {
+    double mx = SLIDE_MAP_BOX[0], my = SLIDE_MAP_BOX[1], mw = SLIDE_MAP_BOX[2], mh = SLIDE_MAP_BOX[3]
+    List<double[]> world = series.collect { List p ->
+        double s = Math.sin(Math.toRadians(p[3] as double))
+        [((p[4] as double) + 180.0) / 360.0, 0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)] as double[]
+    }
+    double xa = world.min { it[0] }[0], xb = world.max { it[0] }[0]
+    double ya = world.min { it[1] }[1], yb = world.max { it[1] }[1]
+    double size = Math.min((mw - 150) / Math.max(xb - xa, 1e-9), (mh - 110) / Math.max(yb - ya, 1e-9))
+    int zoom = Math.min(16, Math.round(Math.log(size / 256.0) / Math.log(2.0)) as int)
+    double offX = (xa + xb) / 2 * size - (mx + mw / 2)
+    double offY = (ya + yb) / 2 * size - (my + mh / 2)
+    double tileSize = size / Math.pow(2, zoom)
+    List<Map> tiles = []
+    try {
+        for (int tx = Math.floor((mx + offX) / tileSize) as int; tx <= (Math.floor((mx + mw + offX) / tileSize) as int); tx++) {
+            for (int ty = Math.floor((my + offY) / tileSize) as int; ty <= (Math.floor((my + mh + offY) / tileSize) as int); ty++) {
+                byte[] png = mapTile(zoom, tx, ty, new java.io.File(mapsDir, 'tiles/osm'))
+                tiles << [x: tx * tileSize - offX, y: ty * tileSize - offY, s: tileSize, href: 'data:image/png;base64,' + png.encodeBase64()]
+            }
+        }
+    } catch (Exception ex) {
+        System.err.println(tr('slide.tilesFailed', ex.message))
+        tiles = []
+    }
+    [W: size, offX: offX, offY: offY, tiles: tiles]
+}
+
+Map slideData(java.io.File file, List<Map> records, Map summary, List<Map> weather, java.io.File mapsDir) {
+    Closure<Integer> secondOfDay = { long epoch -> Instant.ofEpochSecond(epoch).atZone(LOCAL_ZONE).toLocalTime().toSecondOfDay() }
+    List<List> series = []
+    long next = Long.MIN_VALUE
+    records.findAll { it.lat != null && it.altitude != null }.each { r ->
+        long t = r.epochSecond as long
+        if (t >= next) {
+            series << [secondOfDay(t), Math.round((r.distance as double)) / 1000.0, Math.round((r.altitude as double) * 10) / 10.0,
+                       Math.round((r.lat as double) * 1e5) / 1e5, Math.round((r.lon as double) * 1e5) / 1e5]
+            next = t + SLIDE_SAMPLE_S
+        }
+    }
+    // Breaks: stops of three minutes or more, away from the start and finish.
+    List<Map> stops = []
+    int i = 0
+    while (i < records.size()) {
+        if (records[i].moving) {
+            i++
+            continue
+        }
+        int j = i
+        while (j < records.size() && !records[j].moving) {
+            j++
+        }
+        if (i > 0 && j < records.size() && records[i].lat != null) {
+            long from = records[i].epochSecond as long
+            long to = records[j].epochSecond as long
+            if (to - from >= SLIDE_STOP_MIN_S) {
+                stops << [start: secondOfDay(from), dur: to - from, lat: records[i].lat, lon: records[i].lon]
+            }
+        }
+        i = j
+    }
+    Map highlights = slideHighlights(file)
+    Map caption = slideCaption(file)
+    LocalDate date = summary.date as LocalDate
+    long start = records[0].epochSecond as long
+    long finish = records[-1].epochSecond as long
+    String weekday = date.dayOfWeek.getDisplayName(TextStyle.FULL_STANDALONE, lang == 'fi' ? Locale.forLanguageTag('fi') : Locale.UK)
+    String when = tr('slide.when', weekday, longDate(date), clock(start), clock(finish))
+    Map highest = records.findAll { it.altitude != null }.max { it.altitude as double }
+    double stoppedHours = (summary.elapsedHours as double) - (summary.movingHours as double)
+    String breaks = stoppedHours < 1.0 ? unit(Math.round(stoppedHours * 60.0) as double, 0, 'min') : formatHours(stoppedHours)
+    List<Double> altitudes = series.collect { it[2] as double }
+    double low = Math.floor(altitudes.min() / 100.0) * 100.0
+    double top = Math.max(low + 100.0, Math.ceil(altitudes.max() / 100.0) * 100.0)
+    [eyebrow: (caption.label ? caption.label + ' · ' : '') + when,
+     title: (caption.title ?: highlights.route ?: longDate(date)).capitalize(),
+     description: caption.description ?: '',
+     figures: [[tr('slide.distance'), unit(summary.km as double, 1, 'km'), tr('slide.onFoot')],
+               [tr('slide.time'), formatHours(summary.elapsedHours as double), tr('slide.breaks', breaks)],
+               [tr('slide.ascent'), unit(summary.ascent as double, 0, 'm'), tr('slide.descent', unit(summary.descent as double, 0, 'm'))],
+               [tr('slide.highPoint'), unit(highest.altitude as double, 0, 'm'),
+                highlights.highName ?: 'km ' + num((highest.distance as double) / 1000.0, 1)]],
+     places: highlights.places, series: series, stops: stops, weather: slideWeather(weather),
+     elevation: [lo: low, hi: top, label: range(low, top, 0, 'm')], map: slideMap(series, mapsDir)]
+}
+
+// Headless Chrome or Chromium, for printing the deck to PDF.
+String findChrome() {
+    ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/Applications/Chromium.app/Contents/MacOS/Chromium',
+     '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser']
+        .find { new java.io.File(it).canExecute() }
+}
+
+void writeSlides(List<Map> slides, java.io.File target) {
+    Map text = [along: tr('slide.along'), noPlaces: tr('slide.noPlaces'), air: tr('slide.air'), elevation: tr('slide.elevation'),
+                osm: tr('slide.osm'), north: tr('slide.north'), decimal: lang == 'fi' ? ',' : '.', hourSep: lang == 'fi' ? '.' : ':']
+    String html = SLIDE_TEMPLATE.replace('@LANG@', lang).replace('@TITLE@', tr('slide.title'))
+        .replace('/*TEXT*/null', groovy.json.JsonOutput.toJson(text)).replace('/*DAYS*/null', groovy.json.JsonOutput.toJson(slides))
+    target.absoluteFile.parentFile.mkdirs()
+    target.setText(html, 'UTF-8')
+    println tr('slide.written', target.path)
+    String chrome = findChrome()
+    java.io.File pdf = new java.io.File(target.absoluteFile.parentFile, target.name.replaceFirst(/(?i)\.html?$/, '') + '.pdf')
+    if (!chrome) {
+        println tr('slide.noChrome', target.path)
+        return
+    }
+    try {
+        Process process = new ProcessBuilder(chrome, '--headless=new', '--disable-gpu', '--no-pdf-header-footer', '--virtual-time-budget=15000',
+            '--print-to-pdf=' + pdf.absolutePath, target.absoluteFile.toURI().toString()).redirectErrorStream(true).start()
+        process.inputStream.text
+        if (!process.waitFor(180, java.util.concurrent.TimeUnit.SECONDS)) {
+            process.destroy()
+            throw new RuntimeException('timed out')
+        }
+        if (process.exitValue() != 0 || !pdf.exists()) {
+            throw new RuntimeException("exit ${process.exitValue()}")
+        }
+        println tr('slide.pdf', pdf.path)
+    } catch (Exception ex) {
+        System.err.println(tr('slide.pdfFailed', ex.message))
+    }
+}
+
+// The deck's page: one SVG per walk, drawn in the browser from the JSON above. Text and
+// numbers arrive already formatted for the report language.
+@Field final String SLIDE_TEMPLATE = '''<!doctype html>
+<html lang="@LANG@">
+<head>
+<meta charset="utf-8">
+<title>@TITLE@</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Source+Sans+3:wght@400;600&display=swap">
+<style>
+  @page { size: 1920px 1080px; margin: 0; }
+  html, body { margin: 0; padding: 0; background: #f7f9fa; }
+  .slide { width: 1920px; height: 1080px; display: block; break-after: page; }
+  .slide:last-child { break-after: auto; }
+  svg text { font-family: "Source Sans 3", "Helvetica Neue", Arial, sans-serif; }
+  .d { font-family: "Barlow Semi Condensed", "Arial Narrow", sans-serif; }
+</style>
+</head>
+<body>
+<script>
+const TEXT = /*TEXT*/null;
+const DAYS = /*DAYS*/null;
+const NS = "http://www.w3.org/2000/svg", NB = "\\u00a0";
+const C = {
+  paper: "#f7f9fa", ink: "#14232e", muted: "#5b6b76", grid: "#dce3e8", panel: "#eaf0f3",
+  sea: "#1d6585", route: "#c2410c", elev: "#a9bcc6", elevLine: "#4f6573", stop: "#d5dce1"
+};
+function mix(a, b, k) {
+  const p = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  const A = p(a), B = p(b);
+  return "#" + A.map((v, i) => Math.round(v + (B[i] - v) * k).toString(16).padStart(2, "0")).join("");
+}
+// One temperature scale for every walk, so the colours compare across the deck.
+const tempColour = t => t < 22 ? mix("#dfeaf0", "#f8e3a6", Math.max(0, (t - 12) / 10)) : mix("#f8e3a6", "#d97a14", Math.min(1, (t - 22) / 10));
+function el(tag, attrs, parent, text) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+  if (text != null) e.textContent = text;
+  if (parent) parent.appendChild(e);
+  return e;
+}
+// Shrinks a text element until it fits the width.
+function fit(t, width) {
+  let size = parseFloat(t.getAttribute("font-size"));
+  while (t.getComputedTextLength() > width && size > 10) { size -= 1; t.setAttribute("font-size", size); }
+  return t;
+}
+function letterBadge(g, x, y, id, r) {
+  el("rect", { x: x - r, y: y - r, width: 2 * r, height: 2 * r, rx: 4, fill: C.paper, stroke: C.ink, "stroke-width": 2 }, g);
+  el("text", { x, y: y + r * 0.45, "text-anchor": "middle", "font-size": r * 1.25, "font-weight": 700, fill: C.ink, class: "d" }, g, id);
+}
+function stopBadge(g, x, y, n, r) {
+  el("circle", { cx: x, cy: y, r, fill: C.muted, stroke: C.paper, "stroke-width": 2 }, g);
+  el("text", { x, y: y + r * 0.42, "text-anchor": "middle", "font-size": r * 1.2, "font-weight": 700, fill: "#fff", class: "d" }, g, n);
+}
+
+function slide(D, idx) {
+  const svg = el("svg", { class: "slide", viewBox: "0 0 1920 1080" }, document.body);
+  const defs = el("defs", {}, svg);
+  el("rect", { width: 1920, height: 1080, fill: C.paper }, svg);
+  const g = el("g", {}, svg);
+  const S = D.series.map(r => ({ t: r[0], km: r[1], ele: r[2], lat: r[3], lon: r[4] }));
+  const stops = D.stops.map((s, i) => ({ ...s, n: i + 1 }));
+  const nearestKm = km => S.reduce((b, p) => Math.abs(p.km - km) < Math.abs(b.km - km) ? p : b, S[0]);
+  const places = D.places.map((p, i) => ({ ...p, id: "ABCDEFGH"[i], pt: nearestKm(p.km) }));
+  const tEnd = S[S.length - 1].t;
+  const TA = Math.floor(S[0].t / 3600) * 3600, TB = Math.ceil(tEnd / 1800) * 1800;
+
+  // Header
+  el("text", { x: 80, y: 92, "font-size": 22, "font-weight": 600, fill: C.sea, "letter-spacing": 2.5 }, g, D.eyebrow.toUpperCase());
+  fit(el("text", { x: 76, y: 162, "font-size": 68, "font-weight": 700, fill: C.ink, class: "d" }, g, D.title), 1340);
+  if (D.description) fit(el("text", { x: 80, y: 212, "font-size": 24, fill: C.muted }, g, D.description), 1340);
+  if (D.weather) {
+    el("text", { x: 1840, y: 150, "text-anchor": "end", "font-size": 64, "font-weight": 600, fill: C.ink, class: "d" }, g, D.weather.temps);
+    el("text", { x: 1840, y: 186, "text-anchor": "end", "font-size": 20, fill: C.muted }, g, D.weather.sky);
+    el("text", { x: 1840, y: 212, "text-anchor": "end", "font-size": 20, fill: C.muted }, g, D.weather.humidity);
+  }
+
+  // Map
+  const [mx, my, mw, mh] = [80, 250, 560, 490], M = D.map;
+  el("rect", { x: mx, y: my, width: mw, height: mh, rx: 8, fill: C.panel }, g);
+  const clip = el("clipPath", { id: "clip" + idx }, defs);
+  el("rect", { x: mx, y: my, width: mw, height: mh, rx: 8 }, clip);
+  const mute = el("filter", { id: "mute" + idx }, defs);
+  el("feColorMatrix", { type: "saturate", values: "0.35" }, mute);
+  const tg = el("g", { "clip-path": `url(#clip${idx})` }, g);
+  const tl = el("g", { filter: `url(#mute${idx})`, opacity: 0.85 }, tg);
+  for (const t of M.tiles) el("image", { href: t.href, x: t.x, y: t.y, width: t.s, height: t.s, preserveAspectRatio: "none" }, tl);
+  const P = (lat, lon) => {
+    const s = Math.sin(lat * Math.PI / 180);
+    return [(lon + 180) / 360 * M.W - M.offX, (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * M.W - M.offY];
+  };
+  const routeXY = S.map(p => P(p.lat, p.lon));
+  const route = routeXY.map((q, i) => (i ? "L" : "M") + q[0].toFixed(1) + "," + q[1].toFixed(1)).join("");
+  el("path", { d: route, fill: "none", stroke: "#fff", "stroke-width": 11, "stroke-linejoin": "round" }, g);
+  el("path", { d: route, fill: "none", stroke: C.route, "stroke-width": 5.5, "stroke-linejoin": "round", "stroke-linecap": "round" }, g);
+  const [sx, sy] = routeXY[0];
+  el("circle", { cx: sx, cy: sy, r: 9, fill: C.ink, stroke: "#fff", "stroke-width": 3 }, g);
+  // Letters: of twelve directions around each place, the one furthest from the route and the
+  // badges already placed.
+  const taken = stops.map(s => P(s.lat, s.lon)).concat([[sx, sy]]);
+  for (const p of places) {
+    const [x, y] = P(p.pt.lat, p.pt.lon);
+    let best = null;
+    for (const r of [30, 42]) for (let a = 0; a < 12; a++) {
+      const cx = x + r * Math.cos(a * Math.PI / 6), cy = y + r * Math.sin(a * Math.PI / 6);
+      if (cx < mx + 20 || cx > mx + mw - 20 || cy < my + 20 || cy > my + mh - 34) continue;
+      let dr = Infinity; for (let i = 0; i < routeXY.length; i += 3) dr = Math.min(dr, Math.hypot(routeXY[i][0] - cx, routeXY[i][1] - cy));
+      let db = Infinity; for (const q of taken) db = Math.min(db, Math.hypot(q[0] - cx, q[1] - cy));
+      const score = Math.min(dr, 22) + Math.min(db, 34) - r * 0.05;
+      if (!best || score > best.score) best = { cx, cy, score };
+    }
+    if (!best) best = { cx: x, cy: y - 30 };
+    taken.push([best.cx, best.cy]);
+    el("circle", { cx: x, cy: y, r: 5, fill: C.ink }, g);
+    el("line", { x1: x, y1: y, x2: x + (best.cx - x) * 0.6, y2: y + (best.cy - y) * 0.6, stroke: C.ink, "stroke-width": 1.5 }, g);
+    letterBadge(g, best.cx, best.cy, p.id, 13);
+  }
+  for (const s of stops) { const [x, y] = P(s.lat, s.lon); stopBadge(g, x, y, s.n, 12); }
+  const km1 = M.W / (40075.017 * Math.cos(S[0].lat * Math.PI / 180));
+  const bar = km1 > 160 ? 0.5 : km1 < 40 ? 5 : km1 < 80 ? 2 : 1;
+  el("rect", { x: mx + 12, y: my + mh - 60, width: Math.max(km1 * bar, 40) + 24, height: 46, rx: 4, fill: "#fff", "fill-opacity": 0.85 }, g);
+  el("line", { x1: mx + 24, x2: mx + 24 + km1 * bar, y1: my + mh - 26, y2: my + mh - 26, stroke: C.ink, "stroke-width": 3 }, g);
+  el("text", { x: mx + 24, y: my + mh - 36, "font-size": 17, fill: C.muted }, g, String(bar).replace(".", TEXT.decimal) + NB + "km");
+  el("rect", { x: mx + mw - 42, y: my + 8, width: 36, height: 48, rx: 4, fill: "#fff", "fill-opacity": 0.85 }, g);
+  el("path", { d: `M${mx + mw - 24},${my + 14} l-7,13 h14 z`, fill: C.muted }, g);
+  el("text", { x: mx + mw - 24, y: my + 49, "text-anchor": "middle", "font-size": 20, "font-weight": 700, fill: C.muted }, g, TEXT.north);
+  if (M.tiles.length) {
+    el("rect", { x: mx + mw - 210, y: my + mh - 26, width: 210, height: 26, fill: "#fff", "fill-opacity": 0.8 }, tg);
+    el("text", { x: mx + mw - 10, y: my + mh - 8, "text-anchor": "end", "font-size": 14, fill: C.muted }, g, TEXT.osm);
+  }
+
+  // Key figures
+  const fx0 = 720, cw = 290;
+  D.figures.forEach(([lab, val, sub], i) => {
+    const x = fx0 + i * cw, y = 290;
+    el("text", { x, y, "font-size": 18, "font-weight": 600, fill: C.muted, "letter-spacing": 1.5 }, g, lab.toUpperCase());
+    fit(el("text", { x, y: y + 62, "font-size": 60, "font-weight": 600, fill: C.ink, class: "d" }, g, val), cw - 20);
+    fit(el("text", { x, y: y + 92, "font-size": 18, fill: C.muted }, g, sub), cw - 20);
+  });
+
+  // Along the way
+  el("text", { x: fx0, y: 450, "font-size": 18, "font-weight": 600, fill: C.muted, "letter-spacing": 1.5 }, g, TEXT.along.toUpperCase());
+  el("line", { x1: fx0, x2: 1840, y1: 468, y2: 468, stroke: C.grid, "stroke-width": 1.5 }, g);
+  const rows = Math.max(1, Math.ceil(places.length / 2));
+  places.forEach((p, i) => {
+    const col = Math.floor(i / rows), row = i % rows, x = fx0 + col * 570, y = 512 + row * 58;
+    letterBadge(g, x + 14, y - 8, p.id, 14);
+    el("text", { x: x + 44, y, "font-size": 20, fill: C.muted, "font-variant-numeric": "tabular-nums" }, g, p.time);
+    const t = el("text", { x: x + 100, y, "font-size": 22, fill: C.ink }, g);
+    el("tspan", { "font-weight": 600 }, t, p.name);
+    if (p.kind) el("tspan", { fill: C.muted }, t, ", " + p.kind);
+    fit(t, 450);
+  });
+  if (!places.length) el("text", { x: fx0, y: 512, "font-size": 22, fill: C.muted }, g, TEXT.noPlaces);
+
+  // Profile: temperature by hour and elevation, on one time axis
+  const x0 = 220, x1 = 1840;
+  const X = t => x0 + (t - TA) / (TB - TA) * (x1 - x0);
+  const ty = 790, th = 34, ey0 = 862, ey1 = 1010;
+  for (let h = TA / 3600; h <= TB / 3600; h++) {
+    el("line", { x1: X(h * 3600), x2: X(h * 3600), y1: ty, y2: ey1, stroke: C.grid, "stroke-width": 1 }, g);
+    const hour = TEXT.hourSep === ":" ? String(h).padStart(2, "0") : String(h);
+    el("text", { x: X(h * 3600), y: 1046, "text-anchor": "middle", "font-size": 20, fill: C.muted }, g, hour + TEXT.hourSep + "00");
+  }
+  if (D.weather) {
+    el("text", { x: 80, y: ty + 24, "font-size": 20, "font-weight": 600, fill: C.ink }, g, TEXT.air);
+    for (const w of D.weather.hours) {
+      const a = Math.max(TA, w.h * 3600), b = Math.min(TB, (w.h + 1) * 3600);
+      if (b <= a) continue;
+      el("rect", { x: X(a), y: ty, width: X(b) - X(a) - 2, height: th, fill: tempColour(w.temp) }, g);
+      if (X(b) - X(a) > 40) el("text", { x: (X(a) + X(b)) / 2, y: ty + 24, "text-anchor": "middle", "font-size": 18, fill: C.ink }, g, w.label);
+    }
+  }
+  const E = D.elevation, Ye = v => ey1 - (v - E.lo) / (E.hi - E.lo) * (ey1 - ey0);
+  el("text", { x: 80, y: ey0 + 30, "font-size": 20, "font-weight": 600, fill: C.ink }, g, TEXT.elevation);
+  el("text", { x: 80, y: ey0 + 52, "font-size": 17, fill: C.muted }, g, E.label);
+  for (const s of stops) el("rect", { x: X(s.start), y: ey0 - 18, width: Math.max(3, X(s.start + s.dur) - X(s.start)), height: ey1 - ey0 + 18, fill: C.stop }, g);
+  let d = `M${X(S[0].t)},${ey1}`;
+  for (const p of S) d += `L${X(p.t).toFixed(1)},${Ye(p.ele).toFixed(1)}`;
+  el("path", { d: d + `L${X(tEnd)},${ey1}Z`, fill: C.elev }, g);
+  el("path", { d: S.map((p, i) => (i ? "L" : "M") + X(p.t).toFixed(1) + "," + Ye(p.ele).toFixed(1)).join(""), fill: "none", stroke: C.elevLine, "stroke-width": 2 }, g);
+  for (const s of stops) stopBadge(g, X(s.start + s.dur / 2), ey0 - 30, s.n, 12);
+  // Letters above their point, a letter that would touch the previous one lifted clear.
+  let prev = null;
+  for (const p of places) {
+    const x = X(p.pt.t), y = Ye(p.pt.ele);
+    let by = Math.max(y - 26, ey0 - 2);
+    if (prev && Math.abs(x - prev.x) < 28 && Math.abs(by - prev.y) < 28) by = prev.y - 28;
+    el("circle", { cx: x, cy: y, r: 5, fill: C.ink, stroke: C.paper, "stroke-width": 2 }, g);
+    if (y - by > 20) el("line", { x1: x, x2: x, y1: y - 5, y2: by + 12, stroke: C.ink, "stroke-width": 1.2 }, g);
+    letterBadge(g, x, by, p.id, 12);
+    prev = { x, y: by };
+  }
+}
+DAYS.forEach(slide);
+</script>
+</body>
+</html>
+'''
 
 // ----- main -----
 
@@ -2337,4 +2910,10 @@ if (summaries && !options.noReport) {
     target.setText(markdownReport(summaries.size()), 'UTF-8')
     println ''
     println tr('report.written', target.path)
+}
+
+if (summaries && options.slides) {
+    java.io.File first = options.files.find { it.exists() }.absoluteFile
+    java.io.File target = options.slidesFile != null ? options.slidesFile : new java.io.File(first.parentFile, lang == 'en' ? 'walk-slides.html' : "walk-slides.${lang}.html")
+    writeSlides(summaries.findAll { it.slide }.collect { it.slide as Map }, target)
 }
