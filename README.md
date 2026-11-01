@@ -54,7 +54,21 @@ This prints a summary to the console and writes
 `gpx/my-route-profile.html` next to the input file. `gpx/` is a
 suggested, gitignored place to keep your own route files and their
 generated map cache (see below) — they're personal data, not part of the
-tool itself, so nothing under it is tracked or pushed.
+tool itself, so nothing under it is tracked or pushed. It can be a
+separate private repository, with one folder per trek and one shared
+map cache:
+
+```text
+gpx/
+  maps/                shared cache (terrain tiles, OSM, weather)
+  2026-09-gr92/
+    routes/            planned GPX files and their profiles
+    walks/             recorded walks, notes, highlights and captions
+```
+
+All three tools use the nearest existing `maps/` folder in the input
+file's folder or up to three levels above it, and otherwise create one
+next to the input file.
 
 ## What it computes
 
@@ -263,9 +277,9 @@ since the FIT format rounds altitude to 0.2 m steps, which inflates ascent
 by about 3% at small thresholds (`--fit-altitude` uses them anyway). Names
 are matched with whitespace normalised, since Apple Watch names contain a
 non-breaking space that a re-export can turn into a normal one. Terrain
-tiles and weather are cached in the nearest existing `maps/` folder next
-to the input file or one level up (`--maps` to choose), so walks under
-`gpx/real_world/` share the profiler's `gpx/maps/mdt05/` tiles. For each
+tiles and weather are cached in the nearest existing `maps/` folder, as
+for the profiler (`--maps` to choose), so walks under `gpx/<trek>/walks/`
+share the profiler's `gpx/maps/mdt05/` tiles. For each
 walk it reports:
 
 - **Time and distance**: elapsed, moving and stopped time, and the
@@ -481,7 +495,7 @@ gravel rather than pavement.
 - **Query**: a single request fetches both feature types in one union:
   `way["highway"](bbox); wr["natural"~"^(beach|sand|scree|bare_rock)$"](bbox);`.
 - **Caching**: the raw Overpass response is saved as
-  `maps/<gpxBaseName>.osm.json` (created next to the input file). On the
+  `maps/<gpxBaseName>.osm.json` (in the nearest `maps/` folder, see above). On the
   next run, if that file exists it is loaded directly and the API is not
   called again — pass `--no-cache` to force a fresh request. The `maps/`
   folder is gitignored: it's large, regeneratable, third-party-derived

@@ -11,9 +11,11 @@ that turns a GPX hiking route into a colour-coded HTML elevation profile
 track) and `WalkAnalyser.groovy` (analyses recorded Apple Watch walks from
 FIT and GPX exports). Shared classes (`TerrainModel`, `ThermalComfort`) are
 mirrored between the scripts rather than shared, so each runs on its own;
-keep the copies identical. GPX route files, recorded walks
-(`gpx/real_world/`) and generated map cache are kept locally under `gpx/`,
-which is gitignored — not tracked in this repository.
+keep the copies identical. GPX route files, recorded walks and
+generated map cache are kept under `gpx/`, which is gitignored here and is
+its own private repository: one folder per trek (`gpx/<yyyy-mm-trek>/routes/`
+and `walks/`), a shared `gpx/maps/` cache and `gpx/assets/`. Never copy
+anything from it into this public repository.
 
 ## Code style
 
