@@ -381,7 +381,11 @@ Coastal path past coves and over the castle hill, then flat country inland
 `Label:` (`Yläotsikko:` in Finnish) goes before the date in the small line
 above the title, `Title:` (`Otsikko:`) replaces the route from the
 highlights file as the title, and any other line is the description under
-the title. Each part is optional.
+the title. Each part is optional. On the slide, the places in the title
+are joined with arrows (Lloret de Mar → Tordera). To rename a start or end
+point only on the slides, use `Title:`; caption files are never redrafted.
+To rename it in the report too, edit the `Route:` line of the highlights
+file and delete its draft line, so that `--redraft` leaves it alone.
 
 With several files, a final table compares the walks side by side. Its
 ascent, descent and steep figures reproduce the separate Python analyser

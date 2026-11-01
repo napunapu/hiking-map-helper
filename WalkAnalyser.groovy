@@ -2525,7 +2525,8 @@ Map slideData(java.io.File file, List<Map> records, Map summary, List<Map> weath
     double low = Math.floor(altitudes.min() / 100.0) * 100.0
     double top = Math.max(low + 100.0, Math.ceil(altitudes.max() / 100.0) * 100.0)
     [eyebrow: (caption.label ? caption.label + ' · ' : '') + when,
-     title: (caption.title ?: highlights.route ?: longDate(date)).capitalize(),
+     // Places in the title read as a journey: L'Escala → Torroella de Montgrí.
+     title: (caption.title ?: highlights.route ?: longDate(date)).capitalize().replace(' – ', ' → '),
      description: caption.description ?: '',
      figures: [[tr('slide.distance'), unit(summary.km as double, 1, 'km'), tr('slide.onFoot')],
                [tr('slide.time'), formatHours(summary.elapsedHours as double), tr('slide.breaks', breaks)],
