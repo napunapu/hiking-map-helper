@@ -1514,9 +1514,21 @@ java.io.File resolveMapsDir(java.io.File input, java.io.File explicit) {
     if (explicit != null) {
         return explicit
     }
-    java.io.File here = new java.io.File(input.absoluteFile.parentFile, 'maps')
-    java.io.File up = new java.io.File(input.absoluteFile.parentFile.parentFile, 'maps')
-    here.isDirectory() ? here : (up.isDirectory() ? up : here)
+    findMapsDir(input)
+}
+
+// The nearest existing maps/ folder in the input file's folder or up to three levels above it,
+// so trek folders (<trek>/routes/, <trek>/walks/) share one cache; else a new one next to it.
+java.io.File findMapsDir(java.io.File input) {
+    java.io.File folder = input.absoluteFile.parentFile
+    for (int level = 0; level <= 3 && folder != null; level++) {
+        java.io.File candidate = new java.io.File(folder, 'maps')
+        if (candidate.isDirectory()) {
+            return candidate
+        }
+        folder = folder.parentFile
+    }
+    new java.io.File(input.absoluteFile.parentFile, 'maps')
 }
 
 String fetchUrl(String url) {

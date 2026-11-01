@@ -2814,6 +2814,20 @@ boolean breaksEnabled = breakIntervalMin > 0 && breakDurationMin > 0
 double breakIntervalHours = breakIntervalMin / 60.0
 double breakDurationHoursEach = breakDurationMin / 60.0
 
+// The nearest existing maps/ folder in the input file's folder or up to three levels above it,
+// so trek folders (<trek>/routes/, <trek>/walks/) share one cache; else a new one next to it.
+File findMapsDir(File input) {
+    File folder = input.absoluteFile.parentFile
+    for (int level = 0; level <= 3 && folder != null; level++) {
+        File candidate = new File(folder, 'maps')
+        if (candidate.isDirectory()) {
+            return candidate
+        }
+        folder = folder.parentFile
+    }
+    new File(input.absoluteFile.parentFile, 'maps')
+}
+
 List<Map> points = parseGpx(options.gpxFile)
 if (points.size() < 2) {
     System.err.println('GPX file must contain at least two track points.')
@@ -2822,7 +2836,7 @@ if (points.size() < 2) {
 
 // Map data is kept out of the GPX file's own directory (and out of git - see .gitignore)
 // since it's large, regeneratable, third-party-derived cache data rather than source data.
-File mapsDir = new File(options.gpxFile.absoluteFile.parentFile, 'maps')
+File mapsDir = findMapsDir(options.gpxFile)
 mapsDir.mkdirs()
 
 // Planned-route GPX elevations are usually smoothed map data that cut off summits and lose
@@ -2854,7 +2868,7 @@ String matchSource = 'none'
 if (!options.noCache && cacheFile.exists()) {
     osmData = new JsonSlurper().parse(cacheFile) as Map
     matchSource = 'cache'
-    println "Loaded OpenStreetMap data from local cache: maps/${cacheFile.name}"
+    println "Loaded OpenStreetMap data from local cache: ${cacheFile.path}"
 } else {
     // The public Overpass instance can take anywhere from a couple of seconds to the full
     // request timeout below to respond, especially under load - print this up front so a slow
@@ -2903,7 +2917,7 @@ if (!dateSupported) {
     // but only trust it if it actually covers the currently requested date and samples.
     if (cachedTimeline && timelineCoversDate(cachedTimeline, startLocalDate)) {
         weatherTimeline = cachedTimeline
-        println "Loaded weather data from local cache: maps/${weatherCacheFile.name}"
+        println "Loaded weather data from local cache: ${weatherCacheFile.path}"
     } else {
         try {
             String rawJson = fetchWeatherArchiveRaw(weatherSamples, startLocalDate)

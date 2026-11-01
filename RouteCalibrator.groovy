@@ -947,18 +947,32 @@ try {
 double modelledBreakIntervalHours = (breakSpecParsed.intervalMin as int) / 60.0
 double modelledBreakDurationHours = (breakSpecParsed.durationMin as int) / 60.0
 
+// The nearest existing maps/ folder in the input file's folder or up to three levels above it,
+// so trek folders (<trek>/routes/, <trek>/walks/) share one cache; else a new one next to it.
+File findMapsDir(File input) {
+    File folder = input.absoluteFile.parentFile
+    for (int level = 0; level <= 3 && folder != null; level++) {
+        File candidate = new File(folder, 'maps')
+        if (candidate.isDirectory()) {
+            return candidate
+        }
+        folder = folder.parentFile
+    }
+    new File(input.absoluteFile.parentFile, 'maps')
+}
+
 println '=== RouteCalibrator ==='
 println "Planned route  : ${options.plannedGpx}"
 println "Recorded track : ${options.recordedTrack}"
 
-// Locate the OSM cache: explicit override, else maps/<name>.osm.json (ElevationProfiler's
+// Locate the OSM cache: explicit override, else <nearest maps>/<name>.osm.json (ElevationProfiler's
 // convention), else a plain sibling <name>.osm.json next to the planned GPX.
 String plannedBaseName = options.plannedGpx.name.replaceFirst(/(?i)\.gpx$/, '')
 File osmCacheFile = null
 if (options.osmCachePath) {
     osmCacheFile = new File(options.osmCachePath)
 } else {
-    File underMaps = new File(options.plannedGpx.absoluteFile.parentFile, "maps/${plannedBaseName}.osm.json")
+    File underMaps = new File(findMapsDir(options.plannedGpx), "${plannedBaseName}.osm.json")
     File sibling = new File(options.plannedGpx.absoluteFile.parentFile, "${plannedBaseName}.osm.json")
     osmCacheFile = underMaps.exists() ? underMaps : sibling
 }
@@ -979,7 +993,7 @@ if (plannedPoints.size() < 2) {
 }
 // Planned-route elevation, as in ElevationProfiler.groovy: the terrain model by default,
 // since a planned route's GPX elevations are usually smoothed map data.
-File mapsDir = new File(options.plannedGpx.absoluteFile.parentFile, 'maps')
+File mapsDir = findMapsDir(options.plannedGpx)
 TerrainModel terrain = new TerrainModel(new File(mapsDir, 'mdt05'))
 boolean plannedFromTerrain = false
 if (options.elevationSource == 'terrain') {
